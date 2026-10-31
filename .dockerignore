@@ -1,0 +1,6 @@
+.venv
+data
+registry
+frontend
+**/__pycache__
+.env

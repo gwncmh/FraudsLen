@@ -1,0 +1,101 @@
+# FraudLens – Giai đoạn 1 (bản đồ án): tất cả trên một máy.
+#   docker compose up -d --build                         # hệ thống chính
+#   docker compose --profile monitoring up -d            # thêm Prometheus + Grafana
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://fraudlens:fraudlens@postgres:5432/fraudlens
+    REDIS_URL: redis://redis:6379/0
+    SCORER_URL: http://scorer:8001
+    REGISTRY_DIR: /app/registry
+    PLAYBOOK_PATH: /app/kb/playbook.md
+  volumes:
+    - ./registry:/app/registry:ro
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fraudlens
+      POSTGRES_PASSWORD: fraudlens
+      POSTGRES_DB: fraudlens
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraudlens"]
+      interval: 5s
+      retries: 20
+    mem_limit: 768m
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+    mem_limit: 512m
+    restart: unless-stopped
+
+  scorer:
+    <<: *app
+    command: ["uvicorn", "fraudlens.scorer.app:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports: ["8001:8001"]
+    mem_limit: 512m
+
+  api:
+    <<: *app
+    command: ["sh", "-c", "uvicorn fraudlens.api.app:app --host 0.0.0.0 --port 8000 --workers $${API_WORKERS:-2}"]
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      scorer: {condition: service_started}
+    mem_limit: 768m
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "fraudlens.worker.main"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    mem_limit: 384m
+
+  monitor:
+    <<: *app
+    command: ["python", "-m", "fraudlens.monitor.main"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    mem_limit: 384m
+
+  frontend:
+    build: ./frontend
+    ports: ["3000:80"]
+    depends_on: [api]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["monitoring"]
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    mem_limit: 384m
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes: ["./deploy/grafana/provisioning:/etc/grafana/provisioning:ro"]
+    ports: ["3001:3000"]
+    mem_limit: 384m
+
+volumes:
+  pgdata:
+  redisdata:
