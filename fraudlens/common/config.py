@@ -50,6 +50,12 @@ class Settings:
     breaker_fail_threshold: int = field(default_factory=lambda: _int("BREAKER_FAIL_THRESHOLD", 5))
     breaker_open_s: float = field(default_factory=lambda: _float("BREAKER_OPEN_S", 10.0))
     history_window_days: int = field(default_factory=lambda: _int("HISTORY_WINDOW_DAYS", 30))
+    card_lock_ttl_s: float = field(default_factory=lambda: _float("CARD_LOCK_TTL_S", 2.0))
+    card_lock_wait_s: float = field(default_factory=lambda: _float("CARD_LOCK_WAIT_S", 0.5))
+    # Kiểm tra độ tươi theo thời gian của luồng (giao dịch mới nhất đã thấy), không theo đồng hồ máy.
+    # MAX_LATE_S không nên vượt 1 ngày: Redis chỉ giữ lịch sử 30 ngày + 1 ngày đệm tính từ giao dịch mới nhất của thẻ.
+    max_future_s: int = field(default_factory=lambda: _int("MAX_FUTURE_S", 86400))
+    max_late_s: int = field(default_factory=lambda: _int("MAX_LATE_S", 86400))
 
     # Làn chậm
     llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
@@ -63,11 +69,17 @@ class Settings:
     retrieval_k: int = field(default_factory=lambda: _int("RETRIEVAL_K", 5))
     worker_poll_s: float = field(default_factory=lambda: _float("WORKER_POLL_S", 1.0))
     job_stale_s: int = field(default_factory=lambda: _int("JOB_STALE_S", 300))
+    # Tỉ lệ hồ sơ thuộc nhóm đối chứng không hiển thị brief (đo giá trị của brief); 0 = luôn hiển thị
+    brief_holdout_frac: float = field(default_factory=lambda: _float("BRIEF_HOLDOUT_FRAC", 0.0))
 
     # Giám sát
     monitor_interval_s: int = field(default_factory=lambda: _int("MONITOR_INTERVAL_S", 300))
     psi_warn: float = field(default_factory=lambda: _float("PSI_WARN", 0.1))
     psi_alert: float = field(default_factory=lambda: _float("PSI_ALERT", 0.2))
+    monitor_rate_window: int = field(default_factory=lambda: _int("MONITOR_RATE_WINDOW", 5000))
+    unscored_warn: float = field(default_factory=lambda: _float("UNSCORED_WARN", 0.03))
+    unscored_alert: float = field(default_factory=lambda: _float("UNSCORED_ALERT", 0.10))
+    min_label_frauds: int = field(default_factory=lambda: _int("MIN_LABEL_FRAUDS", 30))
 
     def require_hmac(self) -> bytes:
         if len(self.hmac_key) < 16:

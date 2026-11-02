@@ -36,6 +36,13 @@ class HistoryStore:
         p.zremrangebyscore(key, "-inf", rec[0] - self.window - 86400)  # dọn bản ghi quá cũ, chừa 1 ngày đệm
         p.execute()
 
+    def lock(self, card_hash: str):
+        """Khóa theo thẻ: đọc lịch sử -> chấm -> ghi PostgreSQL -> cập nhật lịch sử chạy TUẦN TỰ cho cùng một thẻ.
+        Không có khóa, hai giao dịch cùng thẻ xử lý song song sẽ không thấy nhau (n_txn_1h/24h bị đếm thiếu,
+        lệch với offline). TTL để khóa tự nhả nếu tiến trình chết giữa chừng."""
+        return self.r.lock(f"lock:{card_hash}", timeout=settings.card_lock_ttl_s,
+                           blocking_timeout=settings.card_lock_wait_s)
+
     def is_warm(self) -> bool:
         return bool(self.r.exists(WARM_FLAG))
 

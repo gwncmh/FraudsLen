@@ -1,13 +1,20 @@
-"""Giám sát định kỳ: độ lệch phân bố dữ liệu (PSI, không cần nhãn) và chất lượng model khi nhãn trễ về.
+"""Giám sát định kỳ (Lec 4): độ lệch dữ liệu, độ lệch của chính điểm và phân luồng, chất lượng trên nhãn trễ.
 
 Chạy:  python -m fraudlens.monitor.main            (vòng lặp, mở /metrics ở cổng 9105 cho Prometheus)
        python -m fraudlens.monitor.main --once     (tính một lần rồi thoát)
-Cửa sổ tính theo thời gian giao dịch: 1 ngày gần nhất (PSI) và 30 ngày gần nhất (nhãn).
+
+Số đo:
+- PSI của feature và của phân bố điểm, 1 ngày gần nhất (theo thời gian giao dịch) so với tham chiếu lúc huấn luyện.
+- Tỉ lệ HIGH / MEDIUM so với kỳ vọng trên val_B, tỉ lệ UNSCORED và INVALID – trên N quyết định gần nhất
+  (cửa sổ theo số lượng vì giao dịch lỗi không có event_ts).
+- Recall/precision MEDIUM+HIGH và recall@năng lực review trên nhãn trễ 30 ngày – chỉ báo khi đủ số ca gian lận.
+Mỗi cảnh báo có người chịu trách nhiệm và việc cần làm (ALERT_PLAYBOOK), ghi vào monitor_metrics và log.
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 
 import numpy as np
@@ -21,7 +28,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("fraudlens.monitor")
 PSI_G = Gauge("fraudlens_psi", "PSI so với phân bố lúc huấn luyện", ["feature"])
 Q_G = Gauge("fraudlens_label_metric", "Chất lượng model trên nhãn trễ", ["metric"])
+RATE_G = Gauge("fraudlens_route_rate", "Tỉ lệ phân luồng trên N quyết định gần nhất", ["route"])
+ALERT_G = Gauge("fraudlens_alert", "1 nếu số đo đang ở mức WARN/ALERT", ["metric", "feature"])
 QUEUE_G = Gauge("fraudlens_open_cases", "Số hồ sơ đang mở", ["route"])
+
+# số đo -> (người chịu trách nhiệm, việc cần làm khi WARN/ALERT)
+ALERT_PLAYBOOK = {
+    "psi": ("ML engineer", "So phân bố feature với tham chiếu; nếu kéo dài > 3 ngày: lấy dữ liệu mới, huấn luyện lại, "
+                           "chạy val_B + gate trước khi approve"),
+    "psi_score": ("ML engineer", "Điểm lệch phân bố: kiểm tra feature đầu vào và phiên bản model; đối chiếu tỉ lệ HIGH/MEDIUM"),
+    "route_rate_ratio": ("Risk Lead", "Tỉ lệ hồ sơ lệch kỳ vọng: xem workload so với năng lực review; cân nhắc chỉnh "
+                                      "ngưỡng (ngưỡng mới phải chọn trên dữ liệu có nhãn và duyệt lại qua approve)"),
+    "unscored_rate": ("On-call vận hành", "Nhiều hồ sơ UNSCORED: kiểm tra scorer (breaker), Redis, mã lỗi validation; "
+                                          "báo nguồn dữ liệu nếu INVALID tăng"),
+    "invalid_rate": ("Data owner (nguồn giao dịch)", "Payload lỗi tăng: xem api_validation_errors_total theo mã, báo nguồn"),
+    "label_recall_medium_high": ("Risk Lead + ML engineer", "Recall trên nhãn trễ giảm: phân tích ca bỏ sót theo slice, "
+                                                            "cân nhắc huấn luyện lại"),
+    "label_recall_at_capacity": ("Risk Lead + ML engineer", "Như trên – recall trong năng lực review giảm"),
+}
 
 
 def psi(ref_props: np.ndarray, cur_counts: np.ndarray) -> float:
@@ -35,51 +59,122 @@ def level(v: float) -> str:
     return "ALERT" if v >= settings.psi_alert else ("WARN" if v >= settings.psi_warn else "OK")
 
 
+def ratio_level(observed: float, expected: float) -> tuple[float, str]:
+    """Tỉ lệ quan sát / kỳ vọng. Lệch quá 1.5 lần (hoặc dưới 1/1.5) là WARN, quá 2 lần là ALERT."""
+    if expected <= 0:
+        return float("nan"), "OK"
+    r = observed / expected
+    dev = max(r, 1 / r) if r > 0 else float("inf")
+    return r, ("ALERT" if dev >= 2 else "WARN" if dev >= 1.5 else "OK")
+
+
+def rate_level(v: float, warn: float, alert: float) -> str:
+    return "ALERT" if v >= alert else ("WARN" if v >= warn else "OK")
+
+
+def binned(edges: list[float], n_bins: int, v: np.ndarray) -> np.ndarray:
+    return np.bincount(np.searchsorted(np.array(edges), v, side="right"), minlength=n_bins)
+
+
+def label_metrics(y: np.ndarray, flagged: np.ndarray, scores: np.ndarray, review_frac: float, min_frauds: int) -> list:
+    """Chỉ báo recall khi có ≥ min_frauds ca gian lận (ít hơn thì dao động quá lớn để kết luận)."""
+    out = [("labels_count", None, float(len(y))), ("labels_frauds", None, float(y.sum()))]
+    if y.sum() < min_frauds:
+        out.append(("labels_insufficient", None, float(y.sum())))
+        return out
+    out.append(("label_recall_medium_high", None, float((y & flagged).sum() / y.sum())))
+    if flagged.sum():
+        out.append(("label_precision_medium_high", None, float((y & flagged).sum() / flagged.sum())))
+    ok = ~np.isnan(scores)
+    if ok.sum():
+        ys, ss = y[ok], scores[ok]
+        k = max(1, int(math.ceil(len(ss) * review_frac)))
+        top = np.argsort(-ss, kind="mergesort")[:k]
+        if ys.sum():
+            out.append(("label_recall_at_capacity", None, float(ys[top].sum() / ys.sum())))
+    return out
+
+
 def compute_once() -> None:
-    ref = load_json(active_version(), "reference.json")
+    v = active_version()
+    ref = load_json(v, "reference.json")
+    rc = load_json(v, "routing_config.json")
+    out: list[tuple[str, str | None, float, str | None]] = []  # (metric, feature, value, level)
     with tx() as conn:
+        conn.execute("ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS owner TEXT")
+        conn.execute("ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS action TEXT")
         t_end = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status = 'VALID'").fetchone()["t"]
         if t_end is None:
             log.info("chưa có giao dịch")
             return
         t0 = int(t_end) - 86400
-        rows = conn.execute("SELECT s.features FROM transactions t JOIN scores s ON s.txn_id = t.id "
+        rows = conn.execute("SELECT s.features, s.score FROM transactions t JOIN scores s ON s.txn_id = t.id "
                             "WHERE t.status = 'VALID' AND t.event_ts > %s AND s.features IS NOT NULL", (t0,)).fetchall()
-        out = []
         if len(rows) >= 50:  # quá ít giao dịch thì PSI không có ý nghĩa
             feats = [r["features"] for r in rows]
             for name, spec in ref["numeric"].items():
-                v = np.array([float(f[name]) for f in feats if f.get(name) is not None])
-                counts = np.bincount(np.searchsorted(np.array(spec["edges"]), v, side="right"), minlength=len(spec["props"]))
-                out.append(("psi", name, psi(np.array(spec["props"]), counts)))
+                x = np.array([float(f[name]) for f in feats if f.get(name) is not None])
+                p = psi(np.array(spec["props"]), binned(spec["edges"], len(spec["props"]), x))
+                out.append(("psi", name, p, level(p)))
             ref_cat = ref["categorical"]["category"]
             cats = sorted(ref_cat)
             cur = np.array([sum(1 for f in feats if f.get("category") == c) for c in cats], dtype=float)
-            out.append(("psi", "category", psi(np.array([ref_cat[c] for c in cats]), cur)))
+            p = psi(np.array([ref_cat[c] for c in cats]), cur)
+            out.append(("psi", "category", p, level(p)))
+            if "score" in ref:
+                sc = np.array([float(r["score"]) for r in rows if r["score"] is not None])
+                if len(sc) >= 50:
+                    p = psi(np.array(ref["score"]["props"]), binned(ref["score"]["edges"], len(ref["score"]["props"]), sc))
+                    out.append(("psi_score", "score", p, level(p)))
+
+        # tỉ lệ phân luồng trên N quyết định gần nhất
+        n_win = settings.monitor_rate_window
+        rr = conn.execute(
+            "SELECT d.route, t.status FROM routing_decisions d JOIN transactions t ON t.id = d.txn_id "
+            "ORDER BY d.txn_id DESC LIMIT %s", (n_win,)).fetchall()
+        if len(rr) >= 200:
+            n = len(rr)
+            frac = {k: sum(r["route"] == k for r in rr) / n for k in ("HIGH", "MEDIUM", "UNSCORED")}
+            invalid = sum(r["status"] == "INVALID" for r in rr) / n
+            for k, x in frac.items():
+                RATE_G.labels(k).set(x)
+            exp = ref.get("expected_routes") or {"HIGH": rc["val_b_check"]["frac_high"],
+                                                 "MEDIUM": rc["val_b_check"]["frac_medium"]}
+            for k in ("HIGH", "MEDIUM"):
+                r, lv = ratio_level(frac[k], exp.get(k, 0.0))
+                out.append(("route_rate", k, frac[k], None))
+                if not math.isnan(r):
+                    out.append(("route_rate_ratio", k, r, lv))
+            out.append(("unscored_rate", None, frac["UNSCORED"],
+                        rate_level(frac["UNSCORED"], settings.unscored_warn, settings.unscored_alert)))
+            out.append(("invalid_rate", None, invalid, rate_level(invalid, settings.unscored_warn, settings.unscored_alert)))
+
         # chất lượng trên nhãn trễ (30 ngày gần nhất)
         lab = conn.execute(
-            "SELECT l.is_fraud, d.route FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
-            "JOIN routing_decisions d ON d.txn_id = t.id WHERE t.event_ts > %s", (int(t_end) - 30 * 86400,)).fetchall()
+            "SELECT l.is_fraud, d.route, s.score FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
+            "JOIN routing_decisions d ON d.txn_id = t.id JOIN scores s ON s.txn_id = t.id WHERE t.event_ts > %s",
+            (int(t_end) - 30 * 86400,)).fetchall()
         if lab:
-            y = np.array([r["is_fraud"] for r in lab])
+            y = np.array([bool(r["is_fraud"]) for r in lab])
             flagged = np.array([r["route"] in ("MEDIUM", "HIGH") for r in lab])
-            if y.sum():
-                out.append(("label_recall_medium_high", None, float((y & flagged).sum() / y.sum())))
-            if flagged.sum():
-                out.append(("label_precision_medium_high", None, float((y & flagged).sum() / flagged.sum())))
-            out.append(("labels_count", None, float(len(lab))))
+            scores = np.array([np.nan if r["score"] is None else float(r["score"]) for r in lab])
+            for m, f, val in label_metrics(y, flagged, scores, rc["review_frac"], settings.min_label_frauds):
+                out.append((m, f, val, None))
+
         for r in conn.execute("SELECT route, count(*) AS n FROM cases WHERE status IN ('OPEN','INVESTIGATING','ESCALATED') GROUP BY route"):
             QUEUE_G.labels(r["route"]).set(r["n"])
-        for metric, feature, value in out:
-            lv = level(value) if metric == "psi" else None
-            conn.execute("INSERT INTO monitor_metrics (window_start, window_end, metric, feature, value, level) "
-                         "VALUES (%s,%s,%s,%s,%s,%s)", (t0, int(t_end), metric, feature, value, lv))
-            if metric == "psi":
+        for metric, feature, value, lv in out:
+            owner, action = ALERT_PLAYBOOK.get(metric, (None, None)) if lv in ("WARN", "ALERT") else (None, None)
+            conn.execute("INSERT INTO monitor_metrics (window_start, window_end, metric, feature, value, level, owner, action) "
+                         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (t0, int(t_end), metric, feature, value, lv, owner, action))
+            if metric in ("psi", "psi_score"):
                 PSI_G.labels(feature).set(value)
-                if lv != "OK":
-                    log.warning("PSI %s = %.3f (%s)", feature, value, lv)
-            else:
+            elif metric.startswith("label"):
                 Q_G.labels(metric).set(value)
+            if lv is not None:
+                ALERT_G.labels(metric, feature or "").set(int(lv != "OK"))
+            if owner:
+                log.warning("%s %s = %.4f (%s) -> %s: %s", metric, feature or "", value, lv, owner, action)
     log.info("đã tính %d số đo", len(out))
 
 

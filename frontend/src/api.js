@@ -24,5 +24,6 @@ export const api = {
   caseDetail: (id) => call(`/v1/cases/${id}`),
   act: (id, action, note) => call(`/v1/cases/${id}/actions`, { method: "POST", body: JSON.stringify({ action, note }) }),
   stats: () => call("/v1/stats"),
+  productStats: () => call("/v1/stats/product"),
   config: () => call("/v1/config"),
 };

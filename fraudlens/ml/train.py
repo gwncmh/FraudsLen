@@ -2,11 +2,13 @@
 
   python -m fraudlens.ml.train                       # toàn bộ Sparkov
   python -m fraudlens.ml.train --sample-cards 0.3    # máy yếu / chạy thử nhanh
-  python -m fraudlens.ml.train --baselines           # thêm mốc so sánh luật viết tay và Logistic Regression
+  python -m fraudlens.ml.train --no-baselines        # bỏ mốc so sánh luật/LR (approve sẽ chặn phiên bản này)
+  python -m fraudlens.ml.train --monotone            # ràng buộc đơn điệu: điểm không giảm khi số tiền/tần suất tăng
 
 Các bước: nạp + tối thiểu hóa -> tính feature (hàm dùng chung) -> chia theo thời gian
 -> XGBoost (trọng số lớp căn bậc hai, dừng sớm trên 10% cuối train) -> hiệu chỉnh Platt trên val_A
--> chọn ngưỡng theo năng lực review trên val_A -> kiểm tra trên val_B -> ghi registry.
+-> chọn ngưỡng theo năng lực review trên val_A -> kiểm tra trên val_B (số đo đầy đủ, slice, mốc so sánh)
+-> behavioral test -> ghi registry.
 Test KHÔNG được chạm ở đây (xem fraudlens.ml.final_test).
 """
 from __future__ import annotations
@@ -23,17 +25,29 @@ import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 
 from fraudlens.common.config import settings
-from fraudlens.common.features import CATEGORICAL, FEATURE_SET_VERSION, FEATURE_TYPES, FEATURES, to_model_frame
+from fraudlens.common.features import FEATURE_SET_VERSION, FEATURE_TYPES, FEATURES, to_model_frame
 from fraudlens.common.registry import root, save_json, sha256_file
+from fraudlens.ml import behavior
+from fraudlens.ml.baselines import lr_baseline, rules_score
 from fraudlens.ml.data import load_prepared
-from fraudlens.ml.metrics import choose_thresholds, ranking_metrics, routing_metrics
+from fraudlens.ml.metrics import (choose_thresholds, evaluation_report, ranking_metrics, review_k, routing_metrics,
+                                  span_days)
 from fraudlens.ml.model import logit, platt_apply
 
 MONITORED_NUMERIC = ["amt", "hour", "distance_km", "n_txn_24h", "age"]
+MONOTONE_UP = ["amt_ratio_30d", "amt_zscore_30d", "n_txn_1h", "n_txn_24h"]
 
 
-def reference_stats(F: pd.DataFrame) -> dict:
-    """Phân bố tham chiếu (trên train) cho giám sát PSI: biên 10 bin theo phân vị + tỉ lệ mỗi bin."""
+def score_edges(p: np.ndarray, bins: int = 10) -> dict:
+    """Phân bố tham chiếu của điểm (giám sát drift của chính điểm): biên theo phân vị, thêm biên top 1%."""
+    edges = np.unique(np.concatenate([np.quantile(p, np.linspace(0, 1, bins + 1)[1:-1]), [np.quantile(p, 0.99)]]))
+    counts = np.bincount(np.searchsorted(edges, p, side="right"), minlength=len(edges) + 1)
+    return {"edges": edges.tolist(), "props": (counts / counts.sum()).tolist()}
+
+
+def reference_stats(F: pd.DataFrame, cal_scores: np.ndarray | None = None, expected_routes: dict | None = None) -> dict:
+    """Phân bố tham chiếu cho giám sát: PSI feature (biên 10 bin theo phân vị, trên train),
+    phân bố điểm và tỉ lệ phân luồng kỳ vọng (trên val_B)."""
     ref = {"numeric": {}, "categorical": {}}
     for c in MONITORED_NUMERIC:
         v = F[c].astype(float).to_numpy()
@@ -42,23 +56,11 @@ def reference_stats(F: pd.DataFrame) -> dict:
         ref["numeric"][c] = {"edges": edges.tolist(), "props": (counts / counts.sum()).tolist()}
     vc = F["category"].astype(str).value_counts(normalize=True)
     ref["categorical"]["category"] = vc.to_dict()
+    if cal_scores is not None:
+        ref["score"] = score_edges(cal_scores)
+    if expected_routes is not None:
+        ref["expected_routes"] = expected_routes
     return ref
-
-
-def rules_score(F: pd.DataFrame) -> np.ndarray:
-    """Mốc so sánh: luật viết tay kiểu truyền thống."""
-    return ((F["amt_ratio_30d"] > 3).astype(int) + F["is_night"] + F["is_new_category_30d"]
-            + (F["n_txn_1h"] >= 3).astype(int) + (F["amt"] > 500).astype(int)).to_numpy(float)
-
-
-def lr_baseline(Ftr: pd.DataFrame, ytr: np.ndarray, Fev: pd.DataFrame) -> np.ndarray:
-    num = [c for c in FEATURES if c not in CATEGORICAL]
-    Xtr = pd.get_dummies(Ftr[FEATURES], columns=CATEGORICAL, dtype=float)
-    Xev = pd.get_dummies(Fev[FEATURES], columns=CATEGORICAL, dtype=float).reindex(columns=Xtr.columns, fill_value=0.0)
-    mu, sd = Xtr[num].mean(), Xtr[num].std().replace(0, 1)
-    Xtr[num], Xev[num] = (Xtr[num] - mu) / sd, (Xev[num] - mu) / sd
-    lr = LogisticRegression(max_iter=2000, class_weight="balanced").fit(Xtr.to_numpy(), ytr)
-    return lr.predict_proba(Xev.to_numpy())[:, 1]
 
 
 def main():
@@ -72,7 +74,9 @@ def main():
     ap.add_argument("--learning-rate", type=float, default=0.05)
     ap.add_argument("--max-depth", type=int, default=6)
     ap.add_argument("--n-jobs", type=int, default=0, help="số luồng CPU (0 = tự chọn)")
-    ap.add_argument("--baselines", action="store_true")
+    ap.add_argument("--baselines", action="store_true", help="(giữ cho tương thích – baseline nay chạy mặc định)")
+    ap.add_argument("--no-baselines", action="store_true", help="bỏ qua mốc so sánh (approve sẽ chặn)")
+    ap.add_argument("--monotone", action="store_true", help="ràng buộc đơn điệu tăng cho " + ", ".join(MONOTONE_UP))
     a = ap.parse_args()
 
     t0 = time.time()
@@ -99,6 +103,7 @@ def main():
         subsample=0.8, colsample_bytree=0.8, tree_method="hist", enable_categorical=True,
         feature_types=FEATURE_TYPES,
         scale_pos_weight=spw, eval_metric="aucpr", early_stopping_rounds=50,
+        monotone_constraints=("(" + ",".join("1" if f in MONOTONE_UP else "0" for f in FEATURES) + ")") if a.monotone else None,
         n_jobs=(a.n_jobs or None), random_state=42)
     clf.fit(Xtr[:cut], ytr[:cut], eval_set=[(Xtr[cut:], ytr[cut:])], verbose=False)
     print(f"      số cây dùng: {clf.best_iteration + 1}, scale_pos_weight = {spw:.2f}")
@@ -115,17 +120,46 @@ def main():
     th = choose_thresholds(y[va], cal_a, a.review_frac, a.high_precision, a.capacity_per_day, days_a)
     print(f"      t_medium = {th['t_medium']:.5f}, t_high = {th['t_high']:.5f}, K(val_A) = {th['K']}")
 
-    print("[5/6] Kiểm tra trên val_B")
-    days_b = (df.loc[vb, "event_ts"].max() - df.loc[vb, "event_ts"].min()) / 86400 + 1
-    k_b = int(a.capacity_per_day * days_b) if a.capacity_per_day else int(np.ceil(vb.sum() * a.review_frac))
+    print("[5/6] Kiểm tra trên val_B (số đo đầy đủ, slice, mốc so sánh) + behavioral test")
+    k_b = review_k(int(vb.sum()), a.review_frac, a.capacity_per_day, span_days(df.loc[vb, "event_ts"].to_numpy()))
+    unknown_b = ~F.loc[vb, "category"].astype(str).isin(categories).to_numpy()  # online sẽ thành UNSCORED
+    n_unscored_b = int((unknown_b & (cal_b < th["t_medium"])).sum())
     metrics = {"val_a": ranking_metrics(y[va], cal_a), "val_b": ranking_metrics(y[vb], cal_b),
-               "val_b_routing": routing_metrics(y[vb], cal_b, th["t_medium"], th["t_high"], k_b)}
-    if a.baselines:
-        metrics["baseline_rules_val_b"] = ranking_metrics(y[vb], rules_score(F[vb]))
-        metrics["baseline_lr_val_b"] = ranking_metrics(y[vb], lr_baseline(F[tr], y[tr], F[vb]))
+               "val_b_routing": routing_metrics(y[vb], cal_b, th["t_medium"], th["t_high"], k_b, n_unscored_b),
+               "val_b_report": evaluation_report(y[vb], cal_b, F[vb], df[vb], th["t_medium"], th["t_high"], k_b,
+                                                 n_unscored_b)}
+    if not a.no_baselines:
+        # mốc so sánh đi đúng protocol của model: ngưỡng chọn trên val_A, đánh giá trên val_B, cùng K
+        lr_a, lr_b = lr_baseline(F[tr], y[tr], F[va], F[vb])
+        metrics["baselines_val_b_report"] = {}
+        for name, sa, sb in (("rules", rules_score(F[va]), rules_score(F[vb])), ("lr", lr_a, lr_b)):
+            bth = choose_thresholds(y[va], sa, a.review_frac, a.high_precision, a.capacity_per_day, days_a)
+            metrics[f"baseline_{name}_val_b"] = ranking_metrics(y[vb], sb)
+            metrics["baselines_val_b_report"][name] = evaluation_report(
+                y[vb], sb, F[vb], df[vb], bth["t_medium"], bth["t_high"], k_b, is_probability=(name != "rules"))
     for k, v in metrics.items():
-        keys = [x for x in ("recall_at_0.01", "recall_at_0.003", "pr_auc", "recall_medium_high", "precision_high", "workload_ratio") if x in v]
-        print(f"      {k:22s} " + "  ".join(f"{x}={v[x]:.4f}" for x in keys))
+        keys = [x for x in ("recall_at_0.01", "fp_at_0.01", "recall_at_0.003", "pr_auc", "recall_medium_high",
+                            "precision_high", "workload_ratio") if x in v]
+        if keys:
+            print(f"      {k:22s} " + "  ".join(f"{x}={v[x]:.4f}" for x in keys))
+    rep_b = metrics["val_b_report"]
+    print(f"      F1@t_medium={rep_b['at_t_medium']['f1']:.4f}  Brier={rep_b['calibration']['brier']:.6f}  "
+          f"ECE={rep_b['calibration']['ece']:.6f}  recall@1% CI95={rep_b['recall_at_0.01_ci']['ci95']}")
+    for name, sl in rep_b["slices_at_top1pct"]["slices"].items():
+        if not name.startswith("state="):
+            print(f"      slice {name:26s} n={sl['n']:>7,} frauds={sl['frauds']:>4} recall={sl['recall']:.3f} "
+                  f"CI95=[{sl['recall_ci95'][0]:.3f}, {sl['recall_ci95'][1]:.3f}]")
+
+    def predict(rows: list[dict]) -> np.ndarray:
+        return platt_apply(clf.predict_proba(to_model_frame(rows, categories))[:, 1], a_, b_)
+
+    rs = np.random.default_rng(0)
+    vb_idx = np.where(vb)[0]
+    pick = np.union1d(rs.choice(vb_idx, size=min(2000, len(vb_idx)), replace=False), vb_idx[y[vb_idx] == 1][:500])
+    beh = behavior.run_all(predict, categories, F.iloc[pick][FEATURES], th["t_medium"])
+    print(f"      behavioral: invariance={beh['invariance']['passed']}  mft={beh['mft']['passed']}  "
+          + "  ".join(f"{k}: điểm giảm {v['violation_rate']:.3f}, bị hạ xuống LOW {v['downgrade_rate']:.3f}"
+                      for k, v in beh["directional"].items()))
 
     print("[6/6] Ghi registry")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -143,16 +177,19 @@ def main():
         "feature_set_version": FEATURE_SET_VERSION, "features": FEATURES, "categories": categories,
         "calibration": {"method": "platt", "a": a_, "b": b_, "fit_on": "val_a"},
         "params": {"n_estimators_used": int(clf.best_iteration + 1), "learning_rate": a.learning_rate,
-                   "max_depth": a.max_depth, "scale_pos_weight": spw},
+                   "max_depth": a.max_depth, "scale_pos_weight": spw,
+                   "monotone": MONOTONE_UP if a.monotone else None},
         "data": {"sample_cards": a.sample_cards, "train_span": span(tr), "val_a_span": span(va), "val_b_span": span(vb)},
-        "metrics": metrics, "created_at": stamp,
+        "metrics": metrics, "behavior": beh, "created_at": stamp,
     }
     save_json(version, "manifest.json", manifest)
     save_json(version, "routing_config.json", {
         "config_version": f"routing-{stamp}", "model_version": version, **th,
         "capacity_per_day": a.capacity_per_day, "selected_on": "val_a",
         "val_b_check": metrics["val_b_routing"], "approved_by": None, "approved_at": None})
-    save_json(version, "reference.json", reference_stats(F[tr]))
+    rb = metrics["val_b_routing"]
+    save_json(version, "reference.json", reference_stats(
+        F[tr], cal_b, {"HIGH": rb["frac_high"], "MEDIUM": rb["frac_medium"], "UNSCORED": rb["frac_unscored"]}))
     print(f"\nXong trong {time.time() - t0:.0f} giây. Phiên bản: {version}")
     print("Bước tiếp theo: Risk Lead xem registry/<version>/routing_config.json rồi chạy")
     print(f'  python -m fraudlens.ml.approve --version {version} --by "Tên Risk Lead"')

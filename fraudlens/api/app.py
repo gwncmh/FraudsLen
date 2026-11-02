@@ -20,6 +20,7 @@ from fraudlens.api.auth import User, current_user, require_role, require_source
 from fraudlens.api.service import FastLane
 from fraudlens.common.db import audit, tx, verify_audit_chain
 from fraudlens.common.registry import load_active_routing
+from fraudlens.tools.product import is_holdout, product_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("fraudlens.api")
@@ -39,6 +40,11 @@ def startup() -> None:
         log.error("không nạp được routing config (%s) – mọi giao dịch sẽ thành UNSCORED", e)
         rc = None
     lane = FastLane(rc)
+    try:
+        with tx() as conn:
+            lane.stream_ts = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status IN ('VALID','SEED')").fetchone()["t"]
+    except Exception as e:  # noqa: BLE001 – chưa có thời điểm luồng: bỏ qua kiểm tra độ tươi cho tới giao dịch đầu tiên
+        log.error("không đọc được thời điểm luồng: %s", e)
     try:
         if not lane.hist.is_warm():
             with tx() as conn:
@@ -115,15 +121,21 @@ def get_case(case_id: int, user: User = Depends(current_user)):
                            (case_id,)).fetchone()
         actions = conn.execute("SELECT actor, role, action, note, created_at FROM case_actions WHERE case_id = %s ORDER BY id",
                                (case_id,)).fetchall()
-    return {"case": c, "brief": brief, "brief_job": job, "actions": actions}
+    holdout = is_holdout(case_id)
+    if holdout:  # nhóm đối chứng: chuyên viên xử lý không có brief (brief vẫn được soạn và lưu để đánh giá sau)
+        brief, job = None, None
+    return {"case": c, "brief": brief, "brief_job": job, "brief_holdout": holdout, "actions": actions}
 
 
 class Action(BaseModel):
-    action: Literal["NOTE", "INVESTIGATE", "ESCALATE", "CLOSE_FRAUD", "CLOSE_LEGIT", "REGENERATE_BRIEF"]
+    action: Literal["NOTE", "INVESTIGATE", "ESCALATE", "CLOSE_FRAUD", "CLOSE_LEGIT", "REGENERATE_BRIEF",
+                    "VIEW", "BRIEF_USEFUL", "BRIEF_NOT_USEFUL"]
     note: str | None = None
 
 
 NEW_STATUS = {"INVESTIGATE": "INVESTIGATING", "ESCALATE": "ESCALATED", "CLOSE_FRAUD": "CLOSED_FRAUD", "CLOSE_LEGIT": "CLOSED_LEGIT"}
+# Thao tác chỉ ghi nhận (đo thời gian xử lý, đánh giá brief), không đổi trạng thái – được phép cả khi hồ sơ đã đóng
+PASSIVE = {"VIEW", "BRIEF_USEFUL", "BRIEF_NOT_USEFUL"}
 
 
 @app.post("/v1/cases/{case_id}/actions")
@@ -136,7 +148,7 @@ def act(case_id: int, a: Action, user: User = Depends(current_user)):
         c = conn.execute("SELECT status FROM cases WHERE id = %s FOR UPDATE", (case_id,)).fetchone()
         if not c:
             raise HTTPException(404, "không có hồ sơ")
-        if c["status"].startswith("CLOSED"):
+        if c["status"].startswith("CLOSED") and a.action not in PASSIVE:
             raise HTTPException(409, "hồ sơ đã đóng")
         if c["status"] == "ESCALATED" and a.action.startswith("CLOSE"):
             require_role(user, "risk_lead")
@@ -160,9 +172,16 @@ def stats(user: User = Depends(current_user)):
         routes = conn.execute("SELECT route, count(*) AS n FROM routing_decisions GROUP BY route").fetchall()
         jobs = conn.execute("SELECT status, count(*) AS n FROM brief_jobs GROUP BY status").fetchall()
         drift = conn.execute(
-            "SELECT DISTINCT ON (metric, feature) metric, feature, value, level, computed_at FROM monitor_metrics "
+            "SELECT DISTINCT ON (metric, feature) metric, feature, value, level, owner, action, computed_at FROM monitor_metrics "
             "ORDER BY metric, feature, computed_at DESC").fetchall()
     return {"open_cases": open_by_route, "routes_total": routes, "brief_jobs": jobs, "monitor": drift}
+
+
+@app.get("/v1/stats/product")
+def stats_product(user: User = Depends(current_user)):
+    require_role(user, "risk_lead", "admin")
+    with tx() as conn:
+        return product_metrics(conn)
 
 
 @app.get("/v1/config")

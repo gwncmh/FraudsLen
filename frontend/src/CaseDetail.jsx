@@ -9,7 +9,8 @@ const FEATURE_LABELS = {
   secs_since_last: "Giây từ GD trước", is_night: "Giờ khuya",
 };
 
-function Brief({ brief, job }) {
+function Brief({ brief, job, holdout, onFeedback }) {
+  if (holdout) return <p className="muted">Hồ sơ thuộc nhóm đối chứng: brief không hiển thị (dùng để đo giá trị của brief).</p>;
   if (!brief) return <p className="muted">Brief đang được soạn{job?.last_error ? ` (lỗi gần nhất: ${job.last_error})` : ""}…</p>;
   const b = brief.brief;
   return (
@@ -26,6 +27,11 @@ function Brief({ brief, job }) {
       <ol>{b.checklist.map((c, i) => <li key={i}>{c.step} <span className="src">[{c.source}]</span></li>)}</ol>
       {b.limitations?.length > 0 && (<><h4>Giới hạn</h4><ul>{b.limitations.map((l, i) => <li key={i}>{l}</li>)}</ul></>)}
       <p className="disclaimer">{b.disclaimer}</p>
+      <div className="actions">
+        <span className="muted">Brief này có hữu ích không?</span>
+        <button onClick={() => onFeedback("BRIEF_USEFUL", brief.id)}>Hữu ích</button>
+        <button onClick={() => onFeedback("BRIEF_NOT_USEFUL", brief.id)}>Không hữu ích</button>
+      </div>
     </div>
   );
 }
@@ -37,9 +43,15 @@ export default function CaseDetail({ id, onAuthError }) {
 
   const load = () => api.caseDetail(id).then(setD).catch((e) => { onAuthError(e); setMsg(e.message); });
   useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [id]);
+  // ghi lần mở hồ sơ để đo thời gian xử lý (mở -> đóng); lỗi ở đây không ảnh hưởng thao tác
+  useEffect(() => { api.act(id, "VIEW", null).catch(() => {}); }, [id]);
 
   const act = async (action) => {
     try { await api.act(id, action, note); setNote(""); setMsg("Đã ghi nhận."); load(); }
+    catch (e) { onAuthError(e); setMsg(e.message); }
+  };
+  const feedback = async (action, briefId) => {
+    try { await api.act(id, action, `brief_id=${briefId}`); setMsg("Đã ghi nhận đánh giá brief."); load(); }
     catch (e) { onAuthError(e); setMsg(e.message); }
   };
   if (!d) return <p className="muted">{msg || "Đang tải…"}</p>;
@@ -78,7 +90,7 @@ export default function CaseDetail({ id, onAuthError }) {
         </div>
         <div className="card">
           <h3>Case Brief</h3>
-          <Brief brief={d.brief} job={d.brief_job} />
+          <Brief brief={d.brief} job={d.brief_job} holdout={d.brief_holdout} onFeedback={feedback} />
           <h3>Xử lý</h3>
           {closed ? <p className="muted">Hồ sơ đã đóng.</p> : (<>
             <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Nhận định của chuyên viên (bắt buộc khi đóng hồ sơ)" />
@@ -93,7 +105,7 @@ export default function CaseDetail({ id, onAuthError }) {
           </>)}
           {msg && <p className="muted">{msg}</p>}
           <h3>Lịch sử thao tác</h3>
-          <ul>{d.actions.map((a, i) => <li key={i}>{a.created_at?.slice(0, 19)} · {a.actor} ({a.role}): {a.action}{a.note ? ` – ${a.note}` : ""}</li>)}</ul>
+          <ul>{d.actions.filter((a) => a.action !== "VIEW").map((a, i) => <li key={i}>{a.created_at?.slice(0, 19)} · {a.actor} ({a.role}): {a.action}{a.note ? ` – ${a.note}` : ""}</li>)}</ul>
         </div>
       </div>
     </section>

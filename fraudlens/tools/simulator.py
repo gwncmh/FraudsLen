@@ -4,6 +4,8 @@
   python -m fraudlens.tools.simulator --limit 20000 --tps 200 --threads 8      # kiểm thử tải (Mức 2)
 
 Nhãn is_fraud KHÔNG gửi kèm giao dịch; chỉ gửi qua /v1/labels sau --label-delay-days (tính theo thời gian giao dịch).
+Giao dịch của cùng một thẻ luôn đi qua cùng một luồng gửi (chia theo thẻ) nên đến API đúng thứ tự thời gian,
+giống nguồn thật phát theo từng tài khoản; API còn khóa theo thẻ để hai request cùng thẻ không chạy song song.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import heapq
 import random
 import threading
 import time
+import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -107,7 +110,8 @@ def main():
     delay = int(a.label_delay_days * 86400)
     interval = 1.0 / a.tps if a.tps > 0 else 0
     t_start = time.perf_counter()
-    with ThreadPoolExecutor(a.threads) as pool:
+    shards = [ThreadPoolExecutor(1) for _ in range(max(1, a.threads))]
+    with ThreadPoolExecutor(2) as pool:
         for i, row in enumerate(df.to_dict("records")):
             y = int(row.pop("is_fraud"))
             ev = parse_event_ts(row["trans_date_trans_time"])
@@ -127,11 +131,14 @@ def main():
                 heapq.heappush(labels_heap, (ev + delay, row["trans_num"], y))
                 if len(sent_rows) < 1000:
                     sent_rows.append(payload)
-            pool.submit(send, payload, fault)
+            cc = str(payload.get("cc_num") or i)
+            shards[zlib.crc32(cc.encode()) % len(shards)].submit(send, payload, fault)
             target = t_start + (i + 1) * interval
             sleep = target - time.perf_counter()
             if sleep > 0:
                 time.sleep(sleep)
+        for sh in shards:
+            sh.shutdown(wait=True)
     dur = time.perf_counter() - t_start
     lat = np.array(stats.lat) if stats.lat else np.array([0.0])
     print(f"\nĐã gửi {len(df):,} giao dịch trong {dur:.1f} giây ({len(df) / dur:.1f} giao dịch/giây thực tế)")

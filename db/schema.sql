@@ -111,8 +111,13 @@ CREATE TABLE IF NOT EXISTS monitor_metrics (
     metric        TEXT NOT NULL,
     feature       TEXT,
     value         DOUBLE PRECISION,
-    level         TEXT
+    level         TEXT,
+    owner         TEXT,                        -- người chịu trách nhiệm khi có cảnh báo
+    action        TEXT                         -- việc cần làm khi có cảnh báo
 );
+-- DB tạo từ bản schema cũ: thêm cột (monitor cũng tự chạy lệnh này khi khởi động)
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS owner TEXT;
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS action TEXT;
 
 -- Nhật ký audit chỉ được thêm, mỗi dòng mang băm của dòng trước
 CREATE TABLE IF NOT EXISTS audit_log (

@@ -7,6 +7,9 @@
   python -m fraudlens.tools.admin list-models       # liệt kê tên model mà key này được dùng
   python -m fraudlens.tools.admin test-brief        # soạn thử brief cho hồ sơ MEDIUM/HIGH mới nhất (không ghi gì)
   python -m fraudlens.tools.admin regen-briefs      # soạn lại brief cho mọi hồ sơ MEDIUM/HIGH đang mở
+  python -m fraudlens.tools.admin check-parity [N]  # so feature online với offline trên N giao dịch gần nhất (mặc định 20000)
+  python -m fraudlens.tools.admin product-metrics   # thời gian xử lý hồ sơ có/không có brief LLM, tỉ lệ brief hữu ích
+  python -m fraudlens.tools.admin eval-briefs [N]   # chấm N brief gần nhất theo rubric "nhận định có căn cứ" (mục tiêu ≥ 90%)
 """
 from __future__ import annotations
 
@@ -86,6 +89,28 @@ def main():
             n = conn.execute("INSERT INTO brief_jobs (case_id) SELECT id FROM cases WHERE route IN ('HIGH','MEDIUM') "
                              "AND status NOT LIKE 'CLOSED%'").rowcount
         print(f"đã xếp {n} hồ sơ vào hàng đợi soạn lại brief")
+    elif cmd == "check-parity":
+        from fraudlens.tools.parity import compare, load_from_db
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 20000
+        with tx() as conn:
+            df, online = load_from_db(conn, limit)
+        if not online:
+            raise SystemExit("chưa có giao dịch đã chấm")
+        rep = compare(df, online)
+        print(json.dumps(rep, indent=2, ensure_ascii=False, default=str))
+        print("KHỚP" if not rep["mismatched_rows"] else
+              f"LỆCH {rep['mismatched_rows']}/{rep['compared']} giao dịch – xem per_feature; kiểm tra khóa theo thẻ và thứ tự gửi")
+    elif cmd == "product-metrics":
+        from fraudlens.tools.product import product_metrics
+        with tx() as conn:
+            print(json.dumps(product_metrics(conn), indent=2, ensure_ascii=False, default=str))
+    elif cmd == "eval-briefs":
+        from fraudlens.worker.evaluate import evaluate_db
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+        export = sys.argv[sys.argv.index("--export") + 1] if "--export" in sys.argv else None
+        with tx() as conn:
+            rep = evaluate_db(conn, limit, export)
+        print(json.dumps({k: v for k, v in rep.items() if k != "claims"}, indent=2, ensure_ascii=False))
     else:
         print(__doc__)
 

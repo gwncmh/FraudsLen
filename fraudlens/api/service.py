@@ -14,6 +14,7 @@ from fraudlens.common import pii
 from fraudlens.common.config import settings
 from fraudlens.common.db import J, audit, tx
 from fraudlens.common.features import FEATURE_SET_VERSION, compute, record_of
+from fraudlens.common.registry import load_json
 from fraudlens.common.routing import CASE_ROUTES, route
 from fraudlens.common.validation import validate
 
@@ -23,6 +24,9 @@ LAT = Histogram("api_transaction_latency_seconds", "Độ trễ làn nhanh (nh�
 ROUTES = Counter("api_routes_total", "Số giao dịch theo luồng", ["route"])
 STATUS = Counter("api_score_status_total", "Trạng thái chấm điểm", ["status"])
 HIST_ERR = Counter("api_history_errors_total", "Lỗi đọc/ghi Redis")
+VALID_ERR = Counter("api_validation_errors_total", "Lỗi kiểm tra dữ liệu theo loại", ["code"])
+LOCK_WAIT = Histogram("api_card_lock_wait_seconds", "Thời gian chờ khóa theo thẻ",
+                      buckets=(0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5))
 
 
 class FastLane:
@@ -31,6 +35,9 @@ class FastLane:
         self.hist = HistoryStore()
         self.scorer = ScorerClient()
         self.key = settings.require_hmac()
+        # category lúc huấn luyện: category lạ -> UNKNOWN:category -> UNSCORED (không lặng lẽ thành NaN)
+        self.categories = set(load_json(routing_config["model_version"], "manifest.json")["categories"]) if routing_config else None
+        self.stream_ts: int | None = None  # thời điểm hiện tại của luồng = event_ts lớn nhất đã nhận (đặt lúc khởi động)
 
     # ---- tra cứu kết quả cũ (gửi trùng mã giao dịch -> trả lại kết quả đã lưu, không tạo hồ sơ mới)
     @staticmethod
@@ -54,21 +61,41 @@ class FastLane:
             if old:
                 return old
 
-        errors = validate(raw)
+        errors = validate(raw, self.categories, self.stream_ts, settings.max_future_s, settings.max_late_s)
+        for e in errors:
+            VALID_ERR.labels(e).inc()
         m, feats, sc = None, None, {"status": "INVALID", "error": ",".join(errors)}
+        lock = None
         if not errors:
             m = pii.minimize(raw, self.key)
             try:
+                # khóa theo thẻ giữ tới khi cập nhật lịch sử xong (bước 7) -> cùng thẻ xử lý tuần tự như offline
+                tl = time.perf_counter()
+                lock = self.hist.lock(m["card_hash"])
+                if not lock.acquire():
+                    lock = None
+                    raise TimeoutError("CARD_LOCK_TIMEOUT")
+                LOCK_WAIT.observe(time.perf_counter() - tl)
                 history = self.hist.get(m["card_hash"], m["event_ts"])
                 feats = compute(m, history)
-            except Exception as e:  # noqa: BLE001 – Redis lỗi: không đoán, đưa cho người xem
+            except Exception as e:  # noqa: BLE001 – Redis lỗi / chờ khóa quá lâu: không đoán, đưa cho người xem
                 HIST_ERR.inc()
-                sc = {"status": "HISTORY_UNAVAILABLE", "error": type(e).__name__}
+                sc = {"status": "HISTORY_UNAVAILABLE", "error": str(e) if isinstance(e, TimeoutError) else type(e).__name__}
             if feats is not None:
                 if self.rc is None:
                     sc = {"status": "SCORING_FAILED", "error": "NO_APPROVED_ROUTING_CONFIG"}
                 else:
                     sc = self.scorer.score(feats, self.rc["model_version"])
+        try:
+            return self._finish(raw, tn, errors, m, feats, sc, t0)
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:  # noqa: BLE001 – khóa đã hết hạn: TTL đã nhả, không cần làm gì
+                    pass
+
+    def _finish(self, raw, tn, errors, m, feats, sc, t0) -> dict:
         t_med = self.rc["t_medium"] if self.rc else 1.0
         t_high = self.rc["t_high"] if self.rc else 1.0
         rt = route(sc["status"], sc.get("score"), t_med, t_high)
@@ -97,6 +124,7 @@ class FastLane:
 
         # bước 7: chỉ cập nhật bản sao lịch sử SAU khi đã ghi xong nguồn sự thật
         if m is not None:
+            self.stream_ts = max(self.stream_ts or 0, m["event_ts"])
             try:
                 self.hist.add(record_of(m), m["card_hash"])
             except Exception:  # noqa: BLE001 – Redis dựng lại được từ PostgreSQL
