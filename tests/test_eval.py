@@ -12,6 +12,7 @@ from fraudlens.common.config import settings
 from fraudlens.common.features import FEATURES, compute, record_of
 from fraudlens.common.validation import validate
 from fraudlens.ml import behavior
+from fraudlens.ml.baselines import BASELINES, baseline_scores
 from fraudlens.ml.gates import GateConfig, release_gate
 from fraudlens.ml.metrics import (bootstrap_recall_at, calibration_metrics, ranking_metrics, review_k, routing_metrics,
                                   slice_metrics, threshold_metrics)
@@ -66,6 +67,30 @@ def test_calibration_metrics_on_calibrated_scores():
     assert sum(b["n"] for b in c["reliability"]) == len(p)
     miscal = calibration_metrics(y, np.clip(p * 3, 0, 1))
     assert miscal["ece"] > c["ece"] * 3 and miscal["brier"] > c["brier"]
+
+
+def _baseline_frame(n: int, rng, cats=("grocery_pos", "gas_transport", "shopping_net")) -> tuple[pd.DataFrame, np.ndarray]:
+    F = pd.DataFrame({f: rng.random(n) for f in FEATURES})
+    F["category"] = rng.choice(cats, n)
+    F["is_night"] = (rng.random(n) < 0.2).astype(int)
+    F["is_new_category_30d"] = 0
+    F["amt_ratio_30d"] = rng.exponential(1.0, n)
+    y = (F["amt_ratio_30d"] > 4).to_numpy(int)  # gian lận = số tiền gấp nhiều lần thói quen
+    return F, y
+
+
+def test_baselines_include_tree_and_rank_signal():
+    rng = np.random.default_rng(0)
+    Ftr, ytr = _baseline_frame(20_000, rng)
+    Fsel, _ = _baseline_frame(2_000, rng)
+    Fev, yev = _baseline_frame(5_000, rng, cats=("grocery_pos", "travel"))  # category lạ ở tập đánh giá
+    scores = baseline_scores(Ftr, ytr, Fsel, Fev)
+    assert set(scores) == set(BASELINES) == {"rules", "lr", "tree"}
+    for name, (s_sel, s_ev) in scores.items():
+        assert len(s_sel) == len(Fsel) and len(s_ev) == len(Fev)
+        if BASELINES[name]:
+            assert ((s_ev >= 0) & (s_ev <= 1)).all()
+    assert ranking_metrics(yev, scores["tree"][1])["pr_auc"] > 0.9
 
 
 def test_bootstrap_ci_contains_point_estimate():
@@ -155,6 +180,23 @@ def test_behavior_passes_for_monotone_model():
 def test_behavior_catches_non_monotone_model():
     r = behavior.run_all(anti_predict, ["grocery_pos"], pd.DataFrame(_rows())[FEATURES], 0.05)
     assert not r["directional_passed"] and not r["mft"]["passed"] and not r["passed"]
+
+
+def test_directional_gate_ignores_amount_band_but_reports_it():
+    """Model học khoảng số tiền (như gian lận Sparkov): số tiền ×3 đẩy ra khỏi khoảng nên bị hạ điểm (chỉ báo cáo),
+    nhưng tăng mức bất thường so với thói quen thì điểm không giảm -> directional (phần chặn) đạt."""
+    band = lambda rows: _sig(np.array([np.log(r["amt_ratio_30d"]) + 3 * (100 <= r["amt"] < 300) - 3 for r in rows]))  # noqa: E731
+    r = behavior.run_all(band, ["grocery_pos", "shopping_net"], pd.DataFrame(_rows())[FEATURES], 0.5)
+    assert r["directional"]["amount_x3_vs_habit"]["downgrade_rate"] > 0.5
+    assert r["directional"]["habit_mean_div3"]["downgrade_rate"] == 0.0
+    assert r["directional_passed"] and r["directional_blocking"] == ["habit_mean_div3", "burst_+5_in_1h"]
+
+
+def test_habit_perturbation_keeps_transaction_and_raises_ratio():
+    f = _rows(1)[0]
+    g = behavior._habit_lower(f, 3.0)
+    assert g["amt"] == f["amt"] and g["category"] == f["category"]
+    assert g["amt_ratio_30d"] == pytest.approx(3 * f["amt_ratio_30d"]) and g["amt_zscore_30d"] >= f["amt_zscore_30d"]
 
 
 def test_invariance_catches_model_using_merchant_identity():

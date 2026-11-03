@@ -2,7 +2,7 @@
 
   python -m fraudlens.ml.train                       # toàn bộ Sparkov
   python -m fraudlens.ml.train --sample-cards 0.3    # máy yếu / chạy thử nhanh
-  python -m fraudlens.ml.train --no-baselines        # bỏ mốc so sánh luật/LR (approve sẽ chặn phiên bản này)
+  python -m fraudlens.ml.train --no-baselines        # bỏ mốc so sánh luật/LR/cây (approve sẽ chặn phiên bản này)
   python -m fraudlens.ml.train --monotone            # ràng buộc đơn điệu: điểm không giảm khi số tiền/tần suất tăng
 
 Các bước: nạp + tối thiểu hóa -> tính feature (hàm dùng chung) -> chia theo thời gian
@@ -28,9 +28,9 @@ from fraudlens.common.config import settings
 from fraudlens.common.features import FEATURE_SET_VERSION, FEATURE_TYPES, FEATURES, to_model_frame
 from fraudlens.common.registry import root, save_json, sha256_file
 from fraudlens.ml import behavior
-from fraudlens.ml.baselines import lr_baseline, rules_score
+from fraudlens.ml.baselines import BASELINES, baseline_scores
 from fraudlens.ml.data import load_prepared
-from fraudlens.ml.metrics import (choose_thresholds, evaluation_report, ranking_metrics, review_k, routing_metrics,
+from fraudlens.ml.metrics import (calibration_metrics, choose_thresholds, evaluation_report, ranking_metrics, review_k, routing_metrics,
                                   span_days)
 from fraudlens.ml.model import logit, platt_apply
 
@@ -128,25 +128,29 @@ def main():
                "val_b_routing": routing_metrics(y[vb], cal_b, th["t_medium"], th["t_high"], k_b, n_unscored_b),
                "val_b_report": evaluation_report(y[vb], cal_b, F[vb], df[vb], th["t_medium"], th["t_high"], k_b,
                                                  n_unscored_b)}
+    # hiệu chỉnh trước/sau Platt trên val_B (Platt fit trên val_A) – cho reliability diagram trong báo cáo
+    metrics["val_b_calibration"] = {"before_platt": calibration_metrics(y[vb], raw_b),
+                                    "after_platt": metrics["val_b_report"]["calibration"]}
     if not a.no_baselines:
         # mốc so sánh đi đúng protocol của model: ngưỡng chọn trên val_A, đánh giá trên val_B, cùng K
-        lr_a, lr_b = lr_baseline(F[tr], y[tr], F[va], F[vb])
         metrics["baselines_val_b_report"] = {}
-        for name, sa, sb in (("rules", rules_score(F[va]), rules_score(F[vb])), ("lr", lr_a, lr_b)):
+        for name, (sa, sb) in baseline_scores(F[tr], y[tr], F[va], F[vb]).items():
             bth = choose_thresholds(y[va], sa, a.review_frac, a.high_precision, a.capacity_per_day, days_a)
             metrics[f"baseline_{name}_val_b"] = ranking_metrics(y[vb], sb)
             metrics["baselines_val_b_report"][name] = evaluation_report(
-                y[vb], sb, F[vb], df[vb], bth["t_medium"], bth["t_high"], k_b, is_probability=(name != "rules"))
+                y[vb], sb, F[vb], df[vb], bth["t_medium"], bth["t_high"], k_b, is_probability=BASELINES[name])
     for k, v in metrics.items():
         keys = [x for x in ("recall_at_0.01", "fp_at_0.01", "recall_at_0.003", "pr_auc", "recall_medium_high",
                             "precision_high", "workload_ratio") if x in v]
         if keys:
             print(f"      {k:22s} " + "  ".join(f"{x}={v[x]:.4f}" for x in keys))
     rep_b = metrics["val_b_report"]
-    print(f"      F1@t_medium={rep_b['at_t_medium']['f1']:.4f}  Brier={rep_b['calibration']['brier']:.6f}  "
-          f"ECE={rep_b['calibration']['ece']:.6f}  recall@1% CI95={rep_b['recall_at_0.01_ci']['ci95']}")
+    print(f"      F1@t_medium={rep_b['at_t_medium']['f1']:.4f}  recall@1% CI95={rep_b['recall_at_0.01_ci']['ci95']}")
+    for when, c in metrics["val_b_calibration"].items():
+        print(f"      {when:12s} Brier={c['brier']:.6f}  ECE={c['ece']:.6f}  log_loss={c['log_loss']:.5f}  "
+              f"điểm TB={c['mean_pred']:.5f} (tỉ lệ gian lận {c['fraud_rate']:.5f})")
     for name, sl in rep_b["slices_at_top1pct"]["slices"].items():
-        if not name.startswith("state="):
+        if not name.startswith(("state=", "category=")):  # bang, category: xem manifest hoặc admin report
             print(f"      slice {name:26s} n={sl['n']:>7,} frauds={sl['frauds']:>4} recall={sl['recall']:.3f} "
                   f"CI95=[{sl['recall_ci95'][0]:.3f}, {sl['recall_ci95'][1]:.3f}]")
 

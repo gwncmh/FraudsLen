@@ -28,7 +28,7 @@ def release_gate(manifest: dict, routing_config: dict, cfg: GateConfig = GateCon
 
     base = m.get("baselines_val_b_report") or {}
     if not base:
-        reasons.append("CHƯA CHẠY BASELINE (luật, LR) trên val_B")
+        reasons.append("CHƯA CHẠY BASELINE (luật, LR, cây) trên val_B")
     for name, b in base.items():
         r = b["ranking"]["recall_at_0.01"]
         if not (ours >= r + cfg.baseline_margin):
@@ -56,5 +56,10 @@ def release_gate(manifest: dict, routing_config: dict, cfg: GateConfig = GateCon
     elif not beh.get("passed"):
         failed = [k for k, ok in (("invariance", beh["invariance"]["passed"]), ("mft", beh["mft"]["passed"]),
                                   ("directional", beh["directional_passed"])) if not ok]
+        if "directional" in failed:  # nêu rõ nhiễu nào (phiên bản cũ chặn theo mọi nhiễu)
+            lim = beh.get("directional_max_downgrade_rate", 0.05)
+            bad = [k for k in (beh.get("directional_blocking") or beh["directional"])
+                   if beh["directional"].get(k, {}).get("downgrade_rate", 0) > lim]
+            failed[failed.index("directional")] = f"directional ({', '.join(bad)})"
         reasons.append("behavioral test KHÔNG ĐẠT: " + ", ".join(failed))
     return reasons

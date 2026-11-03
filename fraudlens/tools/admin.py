@@ -3,6 +3,7 @@
   python -m fraudlens.tools.admin rebuild-redis     # dựng lại lịch sử thẻ trong Redis từ PostgreSQL
   python -m fraudlens.tools.admin verify-audit      # kiểm tra chuỗi băm của nhật ký audit
   python -m fraudlens.tools.admin trace <trans_num> # truy vết một giao dịch: điểm, ngưỡng, hồ sơ, brief, thao tác, audit
+  python -m fraudlens.tools.admin trace-all         # T-INT-01: kiểm tra truy vết đủ cho MỌI giao dịch/hồ sơ (thoát mã 1 nếu thiếu)
   python -m fraudlens.tools.admin test-llm          # gọi thử LLM theo cấu hình .env, in rõ lỗi nếu có
   python -m fraudlens.tools.admin list-models       # liệt kê tên model mà key này được dùng
   python -m fraudlens.tools.admin test-brief        # soạn thử brief cho hồ sơ MEDIUM/HIGH mới nhất (không ghi gì)
@@ -10,6 +11,8 @@
   python -m fraudlens.tools.admin check-parity [N]  # so feature online với offline trên N giao dịch gần nhất (mặc định 20000)
   python -m fraudlens.tools.admin product-metrics   # thời gian xử lý hồ sơ có/không có brief LLM, tỉ lệ brief hữu ích
   python -m fraudlens.tools.admin eval-briefs [N]   # chấm N brief gần nhất theo rubric "nhận định có căn cứ" (mục tiêu ≥ 90%)
+  python -m fraudlens.tools.admin report --version <v> [--out reports/<v>] [--replay replay_report.json] [--db]
+                                                    # gom số đo thành report.md + hình cho báo cáo (xem tools/report.py)
 """
 from __future__ import annotations
 
@@ -48,6 +51,17 @@ def main():
             out["audit"] = conn.execute("SELECT seq, ts, entity, action, actor FROM audit_log WHERE entity_id IN (%s,%s) ORDER BY seq",
                                         (tn, str(c["id"]) if c else "-")).fetchall()
         print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+    elif cmd == "trace-all":
+        from fraudlens.tools.integrity import trace_all
+        with tx() as conn:
+            rep = trace_all(conn)
+        print(json.dumps(rep, indent=2, ensure_ascii=False, default=str))
+        print("T-INT-01 ĐẠT" if rep["passed"] else "T-INT-01 KHÔNG ĐẠT – xem các kiểm tra có violations > 0")
+        if not rep["passed"]:
+            raise SystemExit(1)
+    elif cmd == "report":
+        from fraudlens.tools.report import main as report_main
+        report_main(sys.argv[2:])
     elif cmd == "test-llm":
         from fraudlens.common.config import settings
         from fraudlens.worker.llm import LLMClient, LLMUnavailable

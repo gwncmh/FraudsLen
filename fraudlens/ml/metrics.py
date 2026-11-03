@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 
 FRACS = (0.01, 0.003, 0.001)
 
@@ -180,7 +180,7 @@ AMT_BANDS = [(0, 50), (50, 200), (200, 500), (500, 1000), (1000, float("inf"))]
 
 
 def slice_masks(F, df, states: bool = True, min_state_n: int = 1000) -> dict[str, np.ndarray]:
-    """Các slice rủi ro cao: thẻ ít lịch sử (cold-start), online/offline, giao dịch đêm, khoảng số tiền, bang.
+    """Các slice rủi ro cao: thẻ ít lịch sử (cold-start), online/offline, giao dịch đêm, khoảng số tiền, category, bang.
     F: bảng feature, df: bảng giao dịch đã tối thiểu hóa (cùng thứ tự dòng)."""
     cat = F["category"].astype(str).to_numpy()
     amt = F["amt"].to_numpy(float)
@@ -193,6 +193,8 @@ def slice_masks(F, df, states: bool = True, min_state_n: int = 1000) -> dict[str
     }
     for lo, hi in AMT_BANDS:
         m[f"amt[{lo:g},{hi:g})"] = (amt >= lo) & (amt < hi)
+    for v in np.unique(cat):
+        m[f"category={v}"] = cat == v
     if states and "state" in df.columns:
         st = df["state"].astype(str).to_numpy()
         vals, counts = np.unique(st, return_counts=True)
@@ -205,6 +207,18 @@ def slice_masks(F, df, states: bool = True, min_state_n: int = 1000) -> dict[str
 CRITICAL_SLICES = ("cold_start(n_txn_30d<3)", "online", "night")
 
 
+def pr_curve(y: np.ndarray, s: np.ndarray, points: int = 200) -> dict:
+    """Đường precision–recall rút gọn để vẽ hình trong báo cáo: lấy mẫu đều theo recall,
+    precision nội suy (precision lớn nhất tại recall ≥ r)."""
+    if not y.sum():
+        return {"precision": [], "recall": []}
+    p, r, _ = precision_recall_curve(y, s)  # r giảm dần
+    p_interp = np.maximum.accumulate(p)
+    grid = np.linspace(0, 1, points)
+    idx = np.searchsorted(-r, -grid, side="right") - 1
+    return {"precision": p_interp[idx].round(5).tolist(), "recall": grid.round(5).tolist()}
+
+
 def evaluation_report(y: np.ndarray, s: np.ndarray, F, df, t_medium: float, t_high: float, k_capacity: int,
                       n_unscored: int = 0, n_boot: int = 200, is_probability: bool = True) -> dict:
     """Bộ số đo đầy đủ cho một tập (val_B hoặc test) – cùng protocol cho mọi model và mốc so sánh.
@@ -213,6 +227,7 @@ def evaluation_report(y: np.ndarray, s: np.ndarray, F, df, t_medium: float, t_hi
     cut_1pct = float(np.sort(s)[::-1][k1["k"] - 1])
     return {
         "ranking": ranking_metrics(y, s),
+        "pr_curve": pr_curve(y, s),
         "recall_at_0.01_ci": bootstrap_recall_at(y, s, 0.01, n_boot),
         "at_t_medium": threshold_metrics(y, s, t_medium),
         "at_t_high": threshold_metrics(y, s, t_high),

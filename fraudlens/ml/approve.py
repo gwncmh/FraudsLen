@@ -4,7 +4,7 @@
   python -m fraudlens.ml.approve --version <version> --by "Tên Risk Lead"
   python -m fraudlens.ml.approve --version <version> --by "..." --override "lý do"   # duyệt dù gate chặn (ghi lại)
 
-Trước khi duyệt, release gate (fraudlens.ml.gates) tự kiểm tra trên val_B: vượt baseline luật và LR,
+Trước khi duyệt, release gate (fraudlens.ml.gates) tự kiểm tra trên val_B: vượt baseline luật, LR và cây quyết định,
 workload_ratio, recall của slice trọng yếu, behavioral test, đã chạy baseline. Gate chặn thì từ chối,
 trừ khi Risk Lead ghi rõ lý do bằng --override (lý do và danh sách vi phạm lưu trong routing_config.json).
 
@@ -37,7 +37,8 @@ def main():
             rc = load_json(d.name, "routing_config.json")
             manifest = load_json(d.name, "manifest.json")
             m = manifest["metrics"]["val_b"]
-            gate = "gate OK" if not release_gate(manifest, rc, cfg) else "gate CHẶN"
+            gate = "gate OK" if not release_gate(manifest, rc, cfg) else (
+                "gate CHẶN (đã duyệt có override)" if (rc.get("release_gate") or {}).get("override") else "gate CHẶN")
             flag = "ACTIVE " if d.name == active else "       "
             print(f"{flag}{d.name}  recall@1%(val_B)={m['recall_at_0.01']:.4f}  "
                   f"t_medium={rc['t_medium']:.5f} t_high={rc['t_high']:.5f}  {gate}  duyệt bởi: {rc.get('approved_by')}")

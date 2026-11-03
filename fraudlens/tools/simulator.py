@@ -3,6 +3,10 @@
   python -m fraudlens.tools.simulator --csv data/fraudTest.csv --limit 2000 --tps 20
   python -m fraudlens.tools.simulator --limit 20000 --tps 200 --threads 8      # kiểm thử tải (Mức 2)
 
+Kết quả ghi vào --report (mặc định replay_report.json): độ trễ phía client và phía server (p50/p95/p99), phân luồng,
+lỗi, bảng lỗi tiêm × luồng. Tự kiểm T-FAIL-01: không payload lỗi nào được thành LOW (trừ "duplicate" – gửi lại
+giao dịch hợp lệ đã có, API trả kết quả cũ). Vi phạm thì thoát với mã 1.
+
 Nhãn is_fraud KHÔNG gửi kèm giao dịch; chỉ gửi qua /v1/labels sau --label-delay-days (tính theo thời gian giao dịch).
 Giao dịch của cùng một thẻ luôn đi qua cùng một luồng gửi (chia theo thẻ) nên đến API đúng thứ tự thời gian,
 giống nguồn thật phát theo từng tài khoản; API còn khóa theo thẻ để hai request cùng thẻ không chạy song song.
@@ -11,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import json
 import random
 import threading
 import time
 import zlib
 from collections import Counter
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -28,6 +34,8 @@ from fraudlens.common.pii import parse_event_ts
 RAW_COLS = ["trans_date_trans_time", "cc_num", "merchant", "category", "amt", "first", "last", "gender", "street", "city",
             "state", "zip", "lat", "long", "city_pop", "job", "dob", "trans_num", "merch_lat", "merch_long", "is_fraud"]
 FAULTS = ["missing_field", "bad_amt", "negative_amt", "bad_time", "bool_amt", "bad_lat", "duplicate"]
+# lỗi không được phép thành LOW; "duplicate" là giao dịch hợp lệ gửi lại nên được trả đúng luồng cũ
+FAIL_SAFE_FAULTS = set(FAULTS) - {"duplicate"}
 
 
 def inject(row: dict, rng: random.Random) -> tuple[dict, str]:
@@ -52,16 +60,53 @@ class Stats:
     def __init__(self):
         self.lock = threading.Lock()
         self.lat: list[float] = []
+        self.server_lat: list[float] = []
         self.routes = Counter()
         self.errors = Counter()
+        self.fault_routes = Counter()  # (lỗi tiêm, luồng) -> số giao dịch
 
-    def add(self, ms: float, route: str | None, err: str | None):
+    def add(self, ms: float, route: str | None, err: str | None, fault: str | None = None,
+            server_ms: float | None = None):
         with self.lock:
             self.lat.append(ms)
+            if server_ms is not None:
+                self.server_lat.append(server_ms)
             if route:
                 self.routes[route] += 1
             if err:
                 self.errors[err] += 1
+            if fault:
+                self.fault_routes[(fault, route or "NO_RESPONSE")] += 1
+
+
+def percentiles(ms: list[float]) -> dict:
+    if not ms:
+        return {"n": 0}
+    v = np.array(ms)
+    return {"n": len(ms), "p50": float(np.percentile(v, 50)), "p95": float(np.percentile(v, 95)),
+            "p99": float(np.percentile(v, 99)), "max": float(v.max())}
+
+
+def fail_safe_violations(fault_routes: Counter) -> dict[str, int]:
+    """T-FAIL-01: số payload lỗi bị thành LOW, theo loại lỗi. Rỗng = đạt."""
+    return {f: n for (f, rt), n in fault_routes.items() if rt == "LOW" and f in FAIL_SAFE_FAULTS}
+
+
+def build_report(stats: Stats, n_sent: int, dur: float, args: dict) -> dict:
+    faults: dict[str, dict[str, int]] = {}
+    for (f, rt), n in sorted(stats.fault_routes.items()):
+        faults.setdefault(f, {})[rt] = n
+    viol = fail_safe_violations(stats.fault_routes)
+    return {
+        "run_at": datetime.now(timezone.utc).isoformat(), "args": args,
+        "sent": n_sent, "duration_s": dur, "throughput_tps": n_sent / dur if dur else None,
+        "latency_client_ms": percentiles(stats.lat),
+        "latency_server_ms": percentiles(stats.server_lat),
+        "routes": dict(stats.routes), "errors": dict(stats.errors), "faults_by_route": faults,
+        "t_fail_01": {"passed": not viol, "faults_injected": sum(n for (f, _), n in stats.fault_routes.items()
+                                                               if f in FAIL_SAFE_FAULTS),
+                      "faults_to_low": viol},
+    }
 
 
 def main():
@@ -77,6 +122,7 @@ def main():
     ap.add_argument("--label-delay-days", type=float, default=7)
     ap.add_argument("--no-labels", action="store_true")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--report", default="replay_report.json", help="file JSON ghi kết quả (để trống = không ghi)")
     a = ap.parse_args()
 
     df = pd.read_csv(a.csv, usecols=lambda c: c in RAW_COLS, dtype={"cc_num": str, "trans_num": str, "zip": str},
@@ -95,11 +141,12 @@ def main():
             r = client.post(f"{a.api}/v1/transactions", json=payload, headers=headers)
             ms = (time.perf_counter() - t0) * 1000
             if r.status_code == 200:
-                stats.add(ms, r.json().get("route"), f"fault:{fault}" if fault else None)
+                body = r.json()
+                stats.add(ms, body.get("route"), f"fault:{fault}" if fault else None, fault, body.get("latency_ms"))
             else:
-                stats.add(ms, None, f"http_{r.status_code}")
+                stats.add(ms, None, f"http_{r.status_code}", fault)
         except Exception as e:  # noqa: BLE001
-            stats.add((time.perf_counter() - t0) * 1000, None, type(e).__name__)
+            stats.add((time.perf_counter() - t0) * 1000, None, type(e).__name__, fault)
 
     def send_label(tn: str, y: int, ts: int):
         try:
@@ -140,13 +187,24 @@ def main():
         for sh in shards:
             sh.shutdown(wait=True)
     dur = time.perf_counter() - t_start
-    lat = np.array(stats.lat) if stats.lat else np.array([0.0])
+    rep = build_report(stats, len(df), dur, vars(a) | {"key": "***"})
     print(f"\nĐã gửi {len(df):,} giao dịch trong {dur:.1f} giây ({len(df) / dur:.1f} giao dịch/giây thực tế)")
-    print(f"Độ trễ phía client (ms): p50={np.percentile(lat, 50):.1f}  p95={np.percentile(lat, 95):.1f}  "
-          f"p99={np.percentile(lat, 99):.1f}  max={lat.max():.1f}")
-    print("Phân luồng:", dict(stats.routes))
-    print("Lỗi / lỗi tiêm vào:", dict(stats.errors))
+    for side in ("client", "server"):
+        p = rep[f"latency_{side}_ms"]
+        if p["n"]:
+            print(f"Độ trễ phía {side} (ms): p50={p['p50']:.1f}  p95={p['p95']:.1f}  p99={p['p99']:.1f}  max={p['max']:.1f}")
+    print("Phân luồng:", rep["routes"])
+    print("Lỗi / lỗi tiêm vào:", rep["errors"])
+    t = rep["t_fail_01"]
+    print(f"T-FAIL-01 (0 payload lỗi thành LOW): {'ĐẠT' if t['passed'] else 'KHÔNG ĐẠT ' + str(t['faults_to_low'])} "
+          f"– {t['faults_injected']} payload lỗi đã tiêm")
+    if a.report:
+        with open(a.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f, indent=2, ensure_ascii=False)
+        print(f"Đã ghi {a.report}")
     print(f"Lần sau chạy tiếp với --offset {a.offset + len(df)}")
+    if not t["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

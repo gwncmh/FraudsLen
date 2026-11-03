@@ -8,3 +8,5 @@ registry/*
 !registry/.gitkeep
 frontend/node_modules/
 frontend/dist/
+replay_report.json
+reports/

@@ -3,7 +3,7 @@
   python -m fraudlens.ml.final_test --version <version>
 
 - Test LUÔN là toàn bộ fraudTest.csv, kể cả khi model huấn luyện với --sample-cards < 1 (cùng protocol với các nhóm).
-- Mốc so sánh (luật, LR) chạy trên CÙNG test set; ngưỡng của mốc chọn trên val_A với cùng chính sách năng lực review.
+- Mốc so sánh (luật, LR, cây quyết định) chạy trên CÙNG test set; ngưỡng của mốc chọn trên val_A với cùng chính sách năng lực review.
 - K (năng lực review) tính đúng như lúc chọn ngưỡng: capacity_per_day × số ngày nếu có, ngược lại review_frac × số GD.
 Tạo registry/<version>/TEST_RUN.lock; chạy lại sẽ bị từ chối.
 """
@@ -16,9 +16,9 @@ from pathlib import Path
 
 from fraudlens.common.config import settings
 from fraudlens.common.registry import load_json, root, save_json
-from fraudlens.ml.baselines import lr_baseline, rules_score
+from fraudlens.ml.baselines import BASELINES, baseline_scores
 from fraudlens.ml.data import load_prepared
-from fraudlens.ml.metrics import choose_thresholds, evaluation_report, review_k, span_days
+from fraudlens.ml.metrics import calibration_metrics, choose_thresholds, evaluation_report, review_k, span_days
 from fraudlens.ml.model import FraudModel
 
 
@@ -46,7 +46,7 @@ def main():
     model = FraudModel(root() / a.version, manifest)
     model.nthread = 0  # đánh giá cả tập: dùng mọi nhân CPU
     model.booster.set_param({"nthread": 0})
-    _, s = model.predict(model.frame(F[te]))
+    raw, s = model.predict(model.frame(F[te]))
 
     days_te = span_days(df.loc[te, "event_ts"].to_numpy())
     k = review_k(int(te.sum()), rc["review_frac"], rc.get("capacity_per_day"), days_te)
@@ -59,16 +59,16 @@ def main():
                      "days": days_te, "thresholds_from": rc["config_version"]},
         "model": evaluation_report(y, s, F[te], df[te], rc["t_medium"], rc["t_high"], k, n_unscored, a.n_boot),
     }
+    res["calibration"] = {"before_platt": calibration_metrics(y, raw), "after_platt": res["model"]["calibration"]}
 
-    print("Chạy mốc so sánh trên cùng test set (LR huấn luyện trên split train của toàn bộ thẻ)...")
+    print("Chạy mốc so sánh trên cùng test set (LR, cây huấn luyện trên split train của toàn bộ thẻ)...")
     days_a = span_days(df.loc[va, "event_ts"].to_numpy())
-    lr_a, lr_te = lr_baseline(F[tr], y_all[tr], F[va], F[te])
     res["baselines"] = {}
-    for name, sa, st in (("rules", rules_score(F[va]), rules_score(F[te])), ("lr", lr_a, lr_te)):
+    for name, (sa, st) in baseline_scores(F[tr], y_all[tr], F[va], F[te]).items():
         bth = choose_thresholds(y_all[va], sa, rc["review_frac"], rc["high_precision_target"],
                                 rc.get("capacity_per_day"), days_a)
         res["baselines"][name] = evaluation_report(y, st, F[te], df[te], bth["t_medium"], bth["t_high"], k,
-                                                   n_boot=a.n_boot, is_probability=(name != "rules"))
+                                                   n_boot=a.n_boot, is_probability=BASELINES[name])
     # bảng so sánh gọn cho báo cáo
     rows = {"model": res["model"], **res["baselines"]}
     res["comparison"] = {n: {"recall@1%": r["ranking"]["recall_at_0.01"], "precision@1%": r["ranking"]["precision_at_0.01"],
@@ -80,9 +80,9 @@ def main():
     save_json(a.version, "test_results.json", res)
     lock.write_text(datetime.now(timezone.utc).isoformat())
     print(json.dumps(res["comparison"], indent=2))
-    cal = res["model"]["calibration"]
-    print(f"Hiệu chỉnh: Brier={cal['brier']:.6f}  ECE={cal['ece']:.6f}  điểm TB={cal['mean_pred']:.5f}  "
-          f"tỉ lệ gian lận thực={cal['fraud_rate']:.5f}")
+    for when, cal in res["calibration"].items():
+        print(f"Hiệu chỉnh {when:12s} Brier={cal['brier']:.6f}  ECE={cal['ece']:.6f}  điểm TB={cal['mean_pred']:.5f}  "
+              f"tỉ lệ gian lận thực={cal['fraud_rate']:.5f}")
     print(f"Chi tiết (confusion matrix, slice, reliability): registry/{a.version}/test_results.json")
 
 

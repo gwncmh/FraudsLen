@@ -1,7 +1,13 @@
 """Behavioral testing cho model (Lec 5): kiểm tra HÀNH VI chứ không chỉ số đo tổng hợp.
 
 - Invariance: đổi mã giao dịch, đổi tên merchant (giữ nguyên trạng thái mới/cũ của merchant với thẻ) -> điểm không đổi.
-- Directional: số tiền tăng mạnh so với thói quen, hoặc thêm một đợt giao dịch dồn dập -> điểm không được giảm.
+- Directional: giao dịch bất thường hơn so với thói quen của thẻ, hoặc thêm một đợt giao dịch dồn dập -> điểm không
+  được giảm. Release gate chỉ chặn theo các nhiễu trong BLOCKING_DIRECTIONAL:
+    * habit_mean_div3: GIỮ NGUYÊN giao dịch, mức chi tiêu trung bình 30 ngày nhỏ đi 3 lần (tỉ lệ so với thói quen ×3).
+    * burst_+5_in_1h: thêm 5 giao dịch trong 1 giờ trước đó.
+  amount_x3_vs_habit (nhân số tiền ×3) vẫn được tính và báo cáo nhưng KHÔNG chặn: nó đổi luôn khoảng số tiền của giao
+  dịch, mà trong Sparkov gian lận tập trung ở những khoảng số tiền nhất định theo category, nên model đúng với dữ liệu
+  vẫn có thể hạ điểm. Test đó đòi điểm đơn điệu theo amt – giả định dữ liệu không ủng hộ (ép đơn điệu: --monotone).
 - MFT (minimum functionality): vài giao dịch "rõ ràng" phải vào MEDIUM hoặc HIGH.
 
 predict(rows) nhận danh sách dict feature, trả về điểm đã hiệu chỉnh – dùng được cho cả model đang huấn luyện
@@ -19,6 +25,7 @@ import pandas as pd
 from fraudlens.common.features import compute, record_of
 
 Predict = Callable[[list[dict]], np.ndarray]
+BLOCKING_DIRECTIONAL = ("habit_mean_div3", "burst_+5_in_1h")
 D = 86400
 
 
@@ -62,6 +69,21 @@ def _amount_spike(f: dict, factor: float) -> dict:
     return g
 
 
+def _habit_lower(f: dict, factor: float) -> dict:
+    """Cùng giao dịch, nhưng thói quen 30 ngày của thẻ có số tiền trung bình nhỏ đi `factor` lần."""
+    g = dict(f)
+    mean = f["amt_mean_30d"]
+    if mean <= 0:
+        return g
+    new_mean = mean / factor
+    g["amt_mean_30d"], g["amt_ratio_30d"] = new_mean, f["amt"] / new_mean
+    z = f["amt_zscore_30d"]
+    if z and abs(f["amt"] - mean) > 1e-9:
+        sd = (f["amt"] - mean) / z
+        g["amt_zscore_30d"] = max(-50.0, min(50.0, (f["amt"] - new_mean) / sd))
+    return g
+
+
 def _burst(f: dict, extra: int) -> dict:
     """Thêm `extra` giao dịch trong 1 giờ trước đó, số tiền bằng mức trung bình (không đổi thói quen số tiền)."""
     g = dict(f)
@@ -82,6 +104,7 @@ def directional(predict: Predict, rows: list[dict], t_medium: float, rel_tol: fl
     base = predict(rows)
     out = {}
     for name, fn, keep in (
+        ("habit_mean_div3", lambda f: _habit_lower(f, 3.0), lambda f: f["n_txn_30d"] >= 3 and f["amt_mean_30d"] > 0),
         ("amount_x3_vs_habit", lambda f: _amount_spike(f, 3.0), lambda f: f["n_txn_30d"] >= 3),
         ("burst_+5_in_1h", lambda f: _burst(f, 5), lambda f: True),
     ):
@@ -131,8 +154,8 @@ def run_all(predict: Predict, categories: list[str], F_sample: pd.DataFrame, t_m
     m = mft(predict, t_medium)
     dir_ok = directional_ok(dirn, max_downgrade_rate)
     return {"invariance": inv, "directional": dirn, "directional_max_downgrade_rate": max_downgrade_rate,
-            "directional_passed": dir_ok, "mft": m, "passed": bool(inv["passed"] and dir_ok and m["passed"])}
+            "directional_blocking": list(BLOCKING_DIRECTIONAL), "directional_passed": dir_ok, "mft": m, "passed": bool(inv["passed"] and dir_ok and m["passed"])}
 
 
 def directional_ok(dirn: dict, max_downgrade_rate: float) -> bool:
-    return all(v["downgrade_rate"] <= max_downgrade_rate for v in dirn.values())
+    return all(dirn[k]["downgrade_rate"] <= max_downgrade_rate for k in BLOCKING_DIRECTIONAL if k in dirn)
