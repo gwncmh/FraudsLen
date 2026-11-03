@@ -1,4 +1,4 @@
-# FraudLens – mã nguồn theo kiến trúc đã chốt (Nhóm 10, Chủ đề 5)
+# FraudLens (Nhóm 10, Chủ đề 5)
 
 ```
 Nguồn giao dịch ──► API (làn nhanh) ──► Scorer (XGBoost) ─┐
