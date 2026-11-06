@@ -44,6 +44,16 @@ class Settings:
     # Đăng nhập dashboard (bản demo): "tên:token:vai_trò,..." – cơ chế thật sẽ chốt khi hiện thực
     dashboard_tokens: str = field(default_factory=lambda: _env(
         "DASHBOARD_TOKENS", "analyst:analyst-token:analyst,lead:lead-token:risk_lead,admin:admin-token:admin"))
+    # Tài khoản trên web: cho phép tự đăng ký (tài khoản đầu tiên thành admin), thời hạn phiên đăng nhập
+    allow_registration: bool = field(default_factory=lambda: _env("ALLOW_REGISTRATION", "true").lower() in ("1", "true", "yes"))
+    session_ttl_h: int = field(default_factory=lambda: _int("SESSION_TTL_H", 168))
+    # Thư mục chứa fraudTrain.csv / fraudTest.csv (simulator và nạp lịch sử chạy từ giao diện web)
+    data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "data")))
+    # Địa chỉ để trang "Hệ thống" kiểm tra worker / monitor còn chạy (endpoint metrics Prometheus)
+    worker_metrics_url: str = field(default_factory=lambda: _env("WORKER_METRICS_URL", "http://localhost:9104/metrics"))
+    monitor_metrics_url: str = field(default_factory=lambda: _env("MONITOR_METRICS_URL", "http://localhost:9105/metrics"))
+    # API gọi chính nó khi chạy simulator từ web
+    self_api_url: str = field(default_factory=lambda: _env("SELF_API_URL", "http://localhost:8000"))
 
     # Làn nhanh
     scorer_timeout_s: float = field(default_factory=lambda: _float("SCORER_TIMEOUT_S", 0.15))

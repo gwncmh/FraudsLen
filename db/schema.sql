@@ -141,3 +141,39 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_audit_no_update ON audit_log;
 CREATE TRIGGER trg_audit_no_update BEFORE UPDATE OR DELETE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION audit_log_readonly();
+
+-- Tài khoản đăng nhập web (mật khẩu băm PBKDF2, phiên lưu băm SHA-256 của token)
+CREATE TABLE IF NOT EXISTS app_users (
+    id             BIGSERIAL PRIMARY KEY,
+    username       TEXT UNIQUE NOT NULL,
+    display_name   TEXT NOT NULL,
+    password_hash  TEXT NOT NULL,
+    role           TEXT NOT NULL CHECK (role IN ('analyst','risk_lead','admin')),
+    active         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at  TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS app_sessions (
+    token_hash  TEXT PRIMARY KEY,
+    user_id     BIGINT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sessions_user ON app_sessions (user_id);
+
+-- Job vận hành chạy từ giao diện web (simulator, nạp lịch sử...)
+CREATE TABLE IF NOT EXISTS ops_jobs (
+    id            BIGSERIAL PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    params        JSONB NOT NULL DEFAULT '{}',
+    status        TEXT NOT NULL DEFAULT 'RUNNING'
+                  CHECK (status IN ('RUNNING','STOPPING','DONE','FAILED','STOPPED')),
+    progress      JSONB,
+    result        JSONB,
+    error         TEXT,
+    created_by    TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heartbeat_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS ix_ops_jobs_kind ON ops_jobs (kind, id DESC);

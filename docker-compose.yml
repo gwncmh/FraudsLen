@@ -1,6 +1,8 @@
 # FraudLens – Giai đoạn 1 (bản đồ án): tất cả trên một máy.
+#   .\start.ps1  (hoặc nháy đúp start.bat)               # cài đặt + khởi động tự động, mở trình duyệt
 #   docker compose up -d --build                         # hệ thống chính
 #   docker compose --profile monitoring up -d            # thêm Prometheus + Grafana
+#   docker compose --profile tools run --rm trainer      # huấn luyện model trong Docker (không cần cài Python)
 x-app: &app
   build: .
   env_file: .env
@@ -10,6 +12,10 @@ x-app: &app
     SCORER_URL: http://scorer:8001
     REGISTRY_DIR: /app/registry
     PLAYBOOK_PATH: /app/kb/playbook.md
+    DATA_DIR: /app/data
+    WORKER_METRICS_URL: http://worker:9104/metrics
+    MONITOR_METRICS_URL: http://monitor:9105/metrics
+    SELF_API_URL: http://localhost:8000
   volumes:
     - ./registry:/app/registry:ro
   restart: unless-stopped
@@ -54,11 +60,15 @@ services:
     <<: *app
     command: ["sh", "-c", "uvicorn fraudlens.api.app:app --host 0.0.0.0 --port 8000 --workers $${API_WORKERS:-2}"]
     ports: ["8000:8000"]
+    # registry ghi được: Risk Lead duyệt model trên web; data chỉ đọc: simulator và nạp lịch sử chạy từ web
+    volumes:
+      - ./registry:/app/registry
+      - ./data:/app/data:ro
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       scorer: {condition: service_started}
-    mem_limit: 768m
+    mem_limit: 1g
 
   worker:
     <<: *app
@@ -79,6 +89,20 @@ services:
     ports: ["3000:80"]
     depends_on: [api]
     restart: unless-stopped
+
+  # Huấn luyện trong Docker (không cần cài Python trên máy):
+  #   docker compose --profile tools run --rm trainer                    # toàn bộ dữ liệu (máy 16 GB)
+  #   docker compose --profile tools run --rm trainer --sample-cards 0.5 # máy 8 GB
+  trainer:
+    build: .
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      REGISTRY_DIR: /app/registry
+    entrypoint: ["python", "-m", "fraudlens.ml.train", "--data-dir", "/app/data"]
+    volumes:
+      - ./registry:/app/registry
+      - ./data:/app/data
 
   prometheus:
     image: prom/prometheus:v2.54.1

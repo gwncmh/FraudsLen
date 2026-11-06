@@ -11,6 +11,42 @@ Nguồn giao dịch ──► API (làn nhanh) ──► Scorer (XGBoost) ─┐
        Dashboard React ──► chỉ gọi API          Giám sát: PSI + chất lượng trên nhãn trễ ──► Prometheus/Grafana
 ```
 
+## 0. Cách nhanh: chỉ cần Docker Desktop + trình duyệt
+
+1. Cài **Docker Desktop**, mở lên chờ *Engine running* (không cần cài Python hay Node.js).
+2. Đặt `fraudTrain.csv`, `fraudTest.csv` (Kaggle `kartik2112/fraud-detection`) vào thư mục `data\`.
+3. **Nháy đúp `start.bat`** (hoặc `.\start.ps1` trong PowerShell). Script tự: tạo `.env` với `HMAC_KEY` ngẫu nhiên,
+   build image, **huấn luyện model trong Docker** nếu registry chưa có (tự chọn `--sample-cards` theo RAM máy; lần đầu
+   15–30 phút), khởi động mọi dịch vụ và mở http://localhost:3000.
+   Tùy chọn: `start.bat -Monitoring` (thêm Grafana), `start.bat -SampleCards 0.3`, `start.bat -Stop` (tắt).
+4. Trên web, bấm **Đăng ký** – tài khoản đầu tiên là **Admin**. Mọi bước còn lại làm trên giao diện:
+
+Giao diện viết bằng React + Vite theo phong cách shadcn/ui (Tailwind CSS, Radix UI, framer-motion, recharts,
+lucide-react), có chế độ sáng / tối.
+
+| Trang | Nội dung (thay cho lệnh) | Ai dùng |
+| --- | --- | --- |
+| **Dashboard** | KPI (giao dịch, HIGH/MEDIUM đang mở, tỉ lệ gắn cờ, p95 độ trễ, recall trên nhãn trễ); biểu đồ lưu lượng theo luồng (trực tiếp 60 phút / theo thời gian luồng); phân bố điểm rủi ro; **giao dịch bị gắn cờ** mở rộng để xem tín hiệu, yếu tố ảnh hưởng, hành vi thẻ; rule trigger; tổng quan an toàn (dịch vụ, drift); audit trail | mọi người |
+| **Giao dịch** | toàn bộ giao dịch: tìm theo mã / 4 số cuối thẻ / merchant, lọc theo luồng, dữ liệu lỗi, loại merchant, điểm; sắp xếp; phân trang; xuất CSV; bấm dòng để mở panel chi tiết (đồng hồ điểm, feature, yếu tố ảnh hưởng, link hồ sơ) | mọi người |
+| **Xử lý thủ công** | hàng đợi HIGH → MEDIUM → UNSCORED (tab Chuyển cấp, Đã đóng) bên trái, hồ sơ bên phải: Case Brief, điểm và giải thích, hành vi thẻ, lịch sử thao tác; khung **Quyết định** (gian lận / hợp lệ / điều tra / chuyển cấp / ghi nhận định / soạn lại brief), đóng xong tự sang hồ sơ kế tiếp | Analyst, Risk Lead |
+| **Simulator** | `tools.simulator`: nút chạy nhanh hoặc tùy chỉnh; tiến độ, tốc độ, độ trễ, phân luồng trực tiếp, nút **Dừng**; tự chạy tiếp từ offset lần trước; T-FAIL-01 và lịch sử các lần chạy | Risk Lead, Admin |
+| **Model** | `ml.approve`: số đo val_B, release gate, bấm *Duyệt và kích hoạt* (gate chặn thì nhập lý do override). Scorer và API **tự nạp model mới trong ~2 giây** | Risk Lead |
+| **Cài đặt → Hệ thống** | checklist cài đặt, trạng thái dịch vụ; nút *Nạp lịch sử*, *Dựng lại Redis*, *Kiểm tra audit*, *Offline = online*, *Truy vết toàn bộ*, *Kiểm tra LLM*, *Soạn lại brief*, *Chấm brief*; truy vết một giao dịch; job gần đây | Admin (một số nút cho Risk Lead) |
+| **Cài đặt → Người dùng / Audit trail / Tài khoản / Giao diện** | quản lý tài khoản và vai trò; nhật ký audit có tìm kiếm và kiểm tra chuỗi băm; đổi mật khẩu; sáng / tối | theo vai trò |
+
+Thứ tự lần đầu: **Model → Duyệt** (cần tài khoản Risk Lead: Admin tạo ở Cài đặt → Người dùng, hoặc tự đổi vai trò) →
+**Cài đặt → Hệ thống → Nạp lịch sử** → **Simulator → Chạy thử** → **Dashboard / Xử lý thủ công**.
+
+Kịch bản demo cập nhật tiến độ (≤ 5 phút, thao tác + lời dẫn): [docs/DEMO.md](docs/DEMO.md).
+
+Phát triển giao diện không cần Docker: `cd frontend; npm install; npm run dev` (mở http://localhost:5173, gọi API ở cổng 8000).
+
+Tài khoản: mật khẩu băm PBKDF2-SHA256, phiên đăng nhập lưu băm SHA-256 của token (bảng `app_users`, `app_sessions`).
+`ALLOW_REGISTRATION=false` trong `.env` để chỉ Admin tạo tài khoản. Token tĩnh `DASHBOARD_TOKENS` vẫn đăng nhập được
+(link "Đăng nhập bằng token tĩnh"). Việc chạy lâu là **job nền** trong tiến trình API, trạng thái lưu ở bảng `ops_jobs`.
+Đổi LLM vẫn sửa `.env` rồi chạy lại `start.bat` (worker đọc lại cấu hình). Các lệnh dòng lệnh ở mục 4 vẫn dùng được
+như cũ; kiểm thử tải lớn nên chạy simulator bằng Python trên máy (simulator trên web chạy chung tiến trình với API).
+
 ## 1. Thư mục
 
 | Thư mục / file | Thành phần trong báo cáo |
@@ -23,11 +59,12 @@ Nguồn giao dịch ──► API (làn nhanh) ──► Scorer (XGBoost) ─┐
 | `fraudlens\common\registry.py` | Model registry + cấu hình ngưỡng có phiên bản |
 | `fraudlens\ml\` | Huấn luyện XGBoost, hiệu chỉnh Platt, chọn ngưỡng theo năng lực review, duyệt, chạy test một lần |
 | `fraudlens\scorer\app.py` | Scorer – tiến trình riêng |
-| `fraudlens\api\` | API: làn nhanh, Redis, gọi Scorer có ngắt mạch, endpoint cho dashboard |
+| `fraudlens\api\` | API: làn nhanh, Redis, gọi Scorer có ngắt mạch, endpoint cho dashboard; `accounts.py` đăng ký/đăng nhập; `ops.py` job nền (simulator, nạp lịch sử...), trạng thái hệ thống, duyệt model |
+| `start.ps1`, `start.bat` | Cài đặt + huấn luyện (trong Docker) + khởi động bằng một lệnh |
 | `fraudlens\worker\` | LLM worker: outbox, BM25, gọi LLM, kiểm tra brief, brief mẫu |
 | `fraudlens\monitor\` | Giám sát PSI và chất lượng trên nhãn trễ |
 | `fraudlens\tools\` | Simulator, nạp lịch sử, lệnh quản trị (truy vết, kiểm tra audit, kiểm tra LLM) |
-| `frontend\` | Dashboard React |
+| `frontend\` | Giao diện web React: đăng nhập/đăng ký, tổng quan, hàng đợi, hồ sơ, simulator, model, hệ thống, người dùng |
 | `db\schema.sql` | Lược đồ cơ sở dữ liệu |
 | `kb\playbook.md` | Playbook bản nháp (thay khi có playbook chính thức) |
 | `tests\` | Kiểm thử không cần cơ sở dữ liệu |
@@ -184,9 +221,10 @@ không vượt baseline luật và LR; `workload_ratio` > 1,2; recall của slic
 Risk Lead vẫn duyệt được bằng `--override "lý do"`; lý do và danh sách vi phạm lưu trong `routing_config.json`.
 Đổi ngưỡng gate: `--max-workload`, `--slice-floor`.
 
-Lệnh này ghi người duyệt vào `routing_config.json` và tạo `registry\ACTIVE`. **Phải làm trước khi khởi động Docker**,
-nếu không Scorer sẽ khởi động lại liên tục. API từ chối dùng cấu hình chưa duyệt (khi đó mọi giao dịch thành UNSCORED,
-đúng nguyên tắc an toàn khi lỗi).
+Lệnh này ghi người duyệt vào `routing_config.json` và tạo `registry\ACTIVE` (hoặc bấm *Duyệt và kích hoạt* ở trang
+**Model** trên web). Scorer và API tự phát hiện `ACTIVE` đổi và nạp lại trong ~2 giây, nên duyệt trước hay sau khi khởi
+động Docker đều được. Khi chưa có model được duyệt, Scorer trả 503 và API từ chối dùng cấu hình chưa duyệt (mọi giao
+dịch thành UNSCORED, đúng nguyên tắc an toàn khi lỗi).
 
 ### Bước 6 – Khởi động hệ thống
 
@@ -233,7 +271,8 @@ không có giao dịch lỗi nào thành LOW.
 
 ### Bước 9 – Làm việc trên dashboard
 
-Mở http://localhost:3000, đăng nhập bằng token trong `.env`:
+Mở http://localhost:3000, **đăng ký / đăng nhập** bằng tài khoản (tài khoản đầu tiên là Admin, Admin cấp vai trò
+ở trang Người dùng), hoặc bấm "Đăng nhập bằng token tĩnh" và dùng token trong `.env`:
 `analyst-token` (Fraud Analyst), `lead-token` (Risk Lead), `admin-token` (Admin).
 
 Hàng đợi xếp HIGH → MEDIUM → UNSCORED, trong mỗi mức theo điểm rồi số tiền. Mở hồ sơ để xem giao dịch, điểm, ngưỡng,
@@ -387,9 +426,10 @@ python -m fraudlens.tools.admin product-metrics                            # th�
 
 ```powershell
 python -m fraudlens.ml.train ...                                  # tạo phiên bản mới
-python -m fraudlens.ml.approve --version <mới> --by "Risk Lead"   # hoặc <cũ> để quay lui
-docker compose restart scorer api
+python -m fraudlens.ml.approve --version <mới> --by "Risk Lead"   # hoặc <cũ> để quay lui (hoặc trang Model trên web)
 ```
+
+Scorer và API tự nạp model/ngưỡng mới trong ~2 giây (không cần `docker compose restart scorer api`).
 
 API kiểm tra phiên bản model mà Scorer trả về phải khớp với cấu hình ngưỡng đã duyệt; nếu lệch, giao dịch thành UNSCORED.
 

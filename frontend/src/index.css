@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 20% 98%;
+    --foreground: 224 30% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 30% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 30% 10%;
+    --primary: 226 70% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 16% 94%;
+    --secondary-foreground: 224 30% 15%;
+    --muted: 220 16% 95%;
+    --muted-foreground: 220 9% 44%;
+    --accent: 220 16% 94%;
+    --accent-foreground: 224 30% 15%;
+    --destructive: 350 75% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 14% 90%;
+    --input: 220 14% 88%;
+    --ring: 226 70% 52%;
+    --radius: 0.65rem;
+    --sidebar: 0 0% 100%;
+    --sidebar-foreground: 224 20% 25%;
+    --sidebar-border: 220 14% 91%;
+    --critical: 345 80% 48%;
+    --high: 12 85% 54%;
+    --medium: 36 92% 50%;
+    --low: 152 60% 40%;
+    --unscored: 262 60% 58%;
+  }
+  .dark {
+    --background: 224 30% 6%;
+    --foreground: 220 20% 94%;
+    --card: 224 28% 9%;
+    --card-foreground: 220 20% 94%;
+    --popover: 224 28% 9%;
+    --popover-foreground: 220 20% 94%;
+    --primary: 226 85% 66%;
+    --primary-foreground: 224 40% 8%;
+    --secondary: 224 20% 15%;
+    --secondary-foreground: 220 20% 94%;
+    --muted: 224 20% 14%;
+    --muted-foreground: 220 12% 62%;
+    --accent: 224 20% 16%;
+    --accent-foreground: 220 20% 94%;
+    --destructive: 350 75% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 224 18% 17%;
+    --input: 224 18% 20%;
+    --ring: 226 85% 66%;
+    --sidebar: 224 30% 7%;
+    --sidebar-foreground: 220 15% 75%;
+    --sidebar-border: 224 18% 14%;
+    --critical: 345 85% 60%;
+    --high: 12 90% 62%;
+    --medium: 38 95% 58%;
+    --low: 152 55% 50%;
+    --unscored: 262 75% 70%;
+  }
+  * { @apply border-border; }
+  html, body, #root { @apply h-full; }
+  body { @apply bg-background text-foreground antialiased text-sm; font-feature-settings: "cv11", "ss01"; }
+  code { @apply rounded bg-muted px-1.5 py-0.5 font-mono text-xs; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { @apply rounded-full bg-border; border: 2px solid transparent; background-clip: padding-box; }
+}
+
+@layer utilities {
+  .tabular { font-variant-numeric: tabular-nums; }
+}
