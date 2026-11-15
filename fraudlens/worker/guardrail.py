@@ -61,6 +61,42 @@ CLAIMS = [
 ]
 CLAIMS_RE = [(code, re.compile(p), need, ok) for code, p, need, ok in CLAIMS]
 
+# Lời giải thích lỗi gửi lại cho LLM khi sinh lại brief. Model nhỏ (Qwen 7B chạy local) không hiểu mã lỗi trần như
+# "CLAIM_CONTRADICTS_DATA:NEW_CATEGORY" nên lặp lại đúng lỗi cũ; nói rõ cụm từ nào sai và sửa thế nào thì sửa được.
+CLAIM_HINTS = {
+    "NEW_CATEGORY": "cụm 'loại merchant mới' nghĩa là LOẠI HÌNH merchant (category) mới, nhưng is_new_category_30d = 0. "
+                    "Nếu muốn nói merchant mới thì viết đúng 'merchant mới' (không có chữ 'loại')",
+    "NEW_MERCHANT": "nói 'merchant mới' nhưng is_new_merchant_30d = 0",
+    "NIGHT": "nói giờ khuya / ban đêm nhưng is_night = 0",
+    "ONLINE": "nói giao dịch trực tuyến nhưng category không phải loại trực tuyến",
+    "LOW_HISTORY": "nói thẻ ít lịch sử nhưng n_txn_30d không nhỏ",
+    "FAR": "nói khoảng cách xa nhưng distance_km nhỏ",
+    "AMOUNT_SPIKE": "nói số tiền bất thường / gấp nhiều lần nhưng amt_ratio_30d nhỏ hơn 2",
+    "VELOCITY": "nói nhiều giao dịch trong thời gian ngắn nhưng n_txn_1h / n_txn_24h nhỏ",
+}
+ERROR_HINTS = {
+    "CLAIM_CONTRADICTS_DATA": lambda arg: "nhận định trái dữ liệu: " + CLAIM_HINTS.get(arg, arg) + ". Xóa nhận định đó",
+    "CLAIM_UNVERIFIABLE": lambda arg: f"nhận định '{arg}' cần trường {', '.join(next((n for c, _, n, _ in CLAIMS if c == arg), []))} "
+                                      "trong evidence. Thêm trường đó hoặc xóa nhận định",
+    "NUMBER_NOT_IN_DATA": lambda arg: f"số {arg} không có trong DATA. Chỉ chép đúng số có trong DATA",
+    "EVIDENCE_UNKNOWN": lambda arg: f"evidence '{arg}' không phải tên trường trong DATA.fields (hoặc score, route)",
+    "SOURCE_NOT_RETRIEVED": lambda arg: f"source '{arg}' không thuộc SOURCES. Chỉ dùng id có trong SOURCES",
+    "FORBIDDEN": lambda arg: "có câu kết luận gian lận hoặc ra lệnh (khóa thẻ, chặn giao dịch, hoàn tiền) – "
+                             "chỉ gợi ý bước KIỂM TRA, quyết định thuộc về chuyên viên",
+    "DISCLAIMER_MISSING": lambda arg: "thiếu disclaimer",
+    "SCHEMA": lambda arg: f"sai cấu trúc JSON ở {arg}, trả đúng schema",
+}
+
+
+def explain_errors(errs: list[str]) -> str:
+    """Danh sách mã lỗi -> lời giải thích tiếng Việt cho lần sinh lại (giữ nguyên mã để truy vết)."""
+    out = []
+    for e in dict.fromkeys(errs):  # bỏ trùng, giữ thứ tự
+        head, _, arg = str(e).partition(":")
+        hint = ERROR_HINTS.get(head)
+        out.append(f"- {e}: {hint(arg)}" if hint else f"- {e}")
+    return "\n".join(out)
+
 
 def normalize(text: str) -> str:
     t = unicodedata.normalize("NFD", text.lower().replace("đ", "d"))

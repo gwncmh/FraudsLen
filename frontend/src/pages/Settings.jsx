@@ -14,7 +14,7 @@ import { Alert, DataList, Empty, Json, Progress, Skeleton } from "@/components/u
 import { useToast } from "@/components/ui/toast";
 import { PageHeader } from "@/components/fraud";
 import { navigate, usePoll, useTheme } from "@/lib/hooks";
-import { JOB_KINDS, JOB_STATUS, ROLE_LABELS, can, cn, fmtDate, num } from "@/lib/utils";
+import { JOB_KINDS, JOB_STATUS, ROLE_LABELS, can, cn, fmtDate, num, pct } from "@/lib/utils";
 
 const SERVICES = [["postgres", "PostgreSQL"], ["redis", "Redis"], ["api", "API"], ["scorer", "Scorer"], ["worker", "LLM worker"], ["monitor", "Monitor"]];
 const jobVariant = (s) => (s === "DONE" ? "LOW" : s === "FAILED" ? "HIGH" : s === "STOPPED" ? "secondary" : "info");
@@ -27,6 +27,11 @@ function jobLine(j) {
   if (j.kind === "check_parity") return r.mismatched_rows ? `LỆCH ${num(r.mismatched_rows)}/${num(r.compared)}` : `KHỚP (${num(r.compared)} GD)`;
   if (j.kind === "trace_all") return r.passed ? "T-INT-01 ĐẠT" : "T-INT-01 KHÔNG ĐẠT";
   if (j.kind === "simulator") return `${num(r.sent)} GD · p95 ${num(r.latency_client_ms?.p95, 0)} ms · T-FAIL-01 ${r.t_fail_01?.passed ? "ĐẠT" : "KHÔNG ĐẠT"}`;
+  if (j.kind === "eval_briefs") {
+    const raw = r.llm_raw || {};
+    return `${num(r.n_claims)} nhận định · có căn cứ ${pct(r.grounded_rate)}`
+      + (raw.briefs_llm_answered ? ` · LLM qua kiểm tra lần đầu ${pct(raw.first_try_pass_rate)} (${num(raw.briefs_llm_answered)} brief)` : " · chưa có brief do LLM soạn");
+  }
   return "xong";
 }
 
@@ -52,7 +57,7 @@ function SystemTab({ user }) {
     setBusy(key);
     try {
       const r = await fn();
-      if (r?.kind) toast(`Đã bắt đầu: ${JOB_KINDS[r.kind] || r.kind} #${r.id}`); else setOut({ label, data: r });
+      if (r?.kind) toast(`Đã bắt đầu: ${JOB_KINDS[r.kind] || r.kind} #${r.id}`); else setOut({ label, data: r, trace: key === "trace" });
       reload();
     } catch (e) { toast(e.message, "error"); } finally { setBusy(""); }
   };
@@ -69,11 +74,17 @@ function SystemTab({ user }) {
     lead && { key: "traceall", title: "Truy vết toàn bộ", desc: "T-INT-01: mọi giao dịch/hồ sơ có đủ chuỗi truy vết.", icon: FileClock, fn: api.traceAll },
     lead && { key: "llm", title: "Kiểm tra LLM", desc: "Gọi thử LLM theo cấu hình .env.", icon: Server, fn: api.testLlm, label: "Kiểm tra LLM" },
     lead && { key: "regen", title: "Soạn lại brief", desc: "Xếp mọi hồ sơ MEDIUM/HIGH đang mở vào hàng đợi soạn lại.", icon: RefreshCw, fn: api.regenBriefs, label: "Soạn lại brief" },
-    lead && { key: "eval", title: "Chấm brief", desc: "Tỉ lệ nhận định có căn cứ trên 200 brief gần nhất (mục tiêu ≥ 90%).", icon: Check, fn: () => api.evalBriefs(200) },
+    lead && { key: "eval", title: "Chấm brief", desc: "Tỉ lệ nhận định có căn cứ trên 200 brief gần nhất (mục tiêu ≥ 90%) và tỉ lệ đầu ra thô của LLM qua kiểm tra.", icon: Check, fn: () => api.evalBriefs(200) },
   ].filter(Boolean);
 
   return (
     <div className="space-y-6">
+      {s.security_warnings?.length > 0 && (
+        <Alert variant="warn" icon={ShieldCheck} title={`Cấu hình bảo mật cần xem lại (${s.security_warnings.length})`}>
+          <ul className="list-disc space-y-1 pl-4">{s.security_warnings.map((w) => <li key={w}>{w}</li>)}</ul>
+          <p className="mt-1">Sửa file <code>.env</code> rồi chạy lại <code>start.bat</code>.</p>
+        </Alert>
+      )}
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
           <CardHeaderRow icon={Check} title="Các bước cài đặt" description={`${done}/${s.steps.length} hoàn thành`}
@@ -149,7 +160,7 @@ function SystemTab({ user }) {
                 </div>
               ))}
             </div>
-            {out && (
+            {out && !out.trace && (
               <div className="mt-4 space-y-2">
                 <div className="flex items-center justify-between"><p className="text-sm font-semibold">{out.label}</p><Button size="icon" variant="ghost" onClick={() => setOut(null)}><X /></Button></div>
                 <Json data={out.data} />
@@ -159,15 +170,24 @@ function SystemTab({ user }) {
         </Card>
       )}
 
-      <Card>
-        <CardHeaderRow icon={Search} title="Truy vết giao dịch" description="Giao dịch → điểm, model → ngưỡng → hồ sơ → brief → thao tác → audit" />
-        <CardContent>
-          <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); if (tn.trim()) run("trace", () => api.trace(tn.trim()), `Truy vết ${tn.trim()}`); }}>
-            <Input value={tn} onChange={(e) => setTn(e.target.value)} placeholder="Mã giao dịch (trans_num)" />
-            <Button type="submit" disabled={busy === "trace"}>{busy === "trace" ? <Loader2 className="animate-spin" /> : <Search />}Truy vết</Button>
-          </form>
-        </CardContent>
-      </Card>
+      {/* truy vết gồm nhật ký audit -> cùng quyền với tab Audit trail (Risk Lead, Admin) */}
+      {lead && (
+        <Card>
+          <CardHeaderRow icon={Search} title="Truy vết giao dịch" description="Giao dịch → điểm, model → ngưỡng → hồ sơ → brief → thao tác → audit" />
+          <CardContent>
+            <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); if (tn.trim()) run("trace", () => api.trace(tn.trim()), `Truy vết ${tn.trim()}`); }}>
+              <Input value={tn} onChange={(e) => setTn(e.target.value)} placeholder="Mã giao dịch (trans_num)" />
+              <Button type="submit" disabled={busy === "trace"}>{busy === "trace" ? <Loader2 className="animate-spin" /> : <Search />}Truy vết</Button>
+            </form>
+            {out?.trace && (
+              <div className="mt-4 space-y-2">
+                <div className="flex items-center justify-between"><p className="text-sm font-semibold">{out.label}</p><Button size="icon" variant="ghost" onClick={() => setOut(null)}><X /></Button></div>
+                <Json data={out.data} />
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeaderRow icon={FileClock} title="Job gần đây" />
@@ -322,21 +342,18 @@ function AccountTab({ user }) {
       <Card>
         <CardHeaderRow icon={UserRound} title="Thông tin tài khoản" />
         <CardContent>
-          <DataList items={[["Tên đăng nhập", user.username], ["Họ tên", user.display_name], ["Vai trò", ROLE_LABELS[user.role]],
-            ["Kiểu đăng nhập", user.account ? "Tài khoản" : "Token tĩnh (.env)"]]} />
+          <DataList items={[["Tên đăng nhập", user.username], ["Họ tên", user.display_name], ["Vai trò", ROLE_LABELS[user.role]]]} />
         </CardContent>
       </Card>
       <Card>
         <CardHeaderRow icon={KeyRound} title="Đổi mật khẩu" />
         <CardContent>
-          {!user.account ? <p className="text-sm text-muted-foreground">Đăng nhập bằng token tĩnh không đổi được mật khẩu.</p> : (
-            <form className="grid gap-3" onSubmit={submit}>
+          <form className="grid gap-3" onSubmit={submit}>
               <Field label="Mật khẩu hiện tại"><Input type="password" value={f.old} onChange={(e) => setF({ ...f, old: e.target.value })} required autoComplete="current-password" /></Field>
               <Field label="Mật khẩu mới" hint="Ít nhất 8 ký tự, có cả chữ và số."><Input type="password" value={f.pw} onChange={(e) => setF({ ...f, pw: e.target.value })} required autoComplete="new-password" /></Field>
               <Field label="Nhập lại mật khẩu mới"><Input type="password" value={f.confirm} onChange={(e) => setF({ ...f, confirm: e.target.value })} required autoComplete="new-password" /></Field>
               <div><Button type="submit">Đổi mật khẩu</Button></div>
             </form>
-          )}
         </CardContent>
       </Card>
     </div>
@@ -373,7 +390,7 @@ export default function SettingsPage({ user, tab }) {
     <>
       <PageHeader title="Cài đặt" description="Trạng thái hệ thống, thao tác vận hành, người dùng, audit và tài khoản." />
       <Tabs value={current} onValueChange={(v) => navigate(`/settings/${v}`)}>
-        <TabsList>{tabs.map((t) => <TabsTrigger key={t.key} value={t.key}><t.icon />{t.label}</TabsTrigger>)}</TabsList>
+        <TabsList className="h-auto max-w-full flex-wrap justify-start">{tabs.map((t) => <TabsTrigger key={t.key} value={t.key}><t.icon />{t.label}</TabsTrigger>)}</TabsList>
         {tabs.map((t) => <TabsContent key={t.key} value={t.key}>{t.el}</TabsContent>)}
       </Tabs>
     </>

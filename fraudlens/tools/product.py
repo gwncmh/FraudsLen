@@ -1,9 +1,10 @@
 """Số đo giá trị sản phẩm (mục 4.2): thời gian xử lý hồ sơ có và không có brief, tỉ lệ brief được đánh giá hữu ích.
 
-- Thời gian xử lý = từ lần đầu chuyên viên mở hồ sơ (VIEW) tới lúc đóng (CLOSE_FRAUD / CLOSE_LEGIT), lấy từ case_actions.
+- Thời gian xử lý = từ lần đầu chuyên viên mở hồ sơ (VIEW) tới lúc đóng (CLOSE_*), lấy từ case_actions.
 - Nhóm so sánh theo brief chuyên viên THẤY lúc mở hồ sơ: llm / fallback / none (brief chưa soạn xong),
   và theo nhóm đối chứng ngẫu nhiên (BRIEF_HOLDOUT_FRAC: hồ sơ bị ẩn brief) – so sánh nhân quả sạch hơn quan sát.
 - Hữu ích: nút BRIEF_USEFUL / BRIEF_NOT_USEFUL, mỗi (hồ sơ, chuyên viên) lấy lần bấm cuối.
+- Quyết định của chuyên viên so với nhãn trễ: chỉ ở dạng tổng hợp trên hồ sơ ĐÃ đóng (không lộ đáp án của hồ sơ đang mở).
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from fraudlens.common.config import settings
 HANDLING_SQL = """
 WITH v AS (SELECT case_id, min(created_at) AS first_view FROM case_actions WHERE action = 'VIEW' GROUP BY case_id),
      cl AS (SELECT case_id, min(created_at) AS closed_at FROM case_actions
-            WHERE action IN ('CLOSE_FRAUD','CLOSE_LEGIT') GROUP BY case_id)
+            WHERE action LIKE 'CLOSE%' GROUP BY case_id)
 SELECT c.id, c.route, EXTRACT(EPOCH FROM cl.closed_at - v.first_view) AS handling_s,
        (SELECT b.brief_source FROM briefs b WHERE b.case_id = c.id AND b.created_at <= v.first_view
         ORDER BY b.created_at DESC LIMIT 1) AS brief_at_view
@@ -26,6 +27,10 @@ SELECT f.case_id, f.action,
         ORDER BY b.created_at DESC LIMIT 1) AS brief_source
 FROM (SELECT DISTINCT ON (case_id, actor) case_id, actor, action, created_at FROM case_actions
       WHERE action IN ('BRIEF_USEFUL','BRIEF_NOT_USEFUL') ORDER BY case_id, actor, id DESC) f
+"""
+DECISION_SQL = """
+SELECT c.status, l.is_fraud, count(*) AS n FROM cases c JOIN transactions t ON t.id = c.txn_id
+JOIN labels_eval l ON l.trans_num = t.trans_num WHERE c.status IN ('CLOSED_FRAUD','CLOSED_LEGIT') GROUP BY 1, 2
 """
 
 
@@ -40,6 +45,16 @@ def _summary(v: list[float]) -> dict:
         return {"n": 0}
     a = np.array(v, dtype=float)
     return {"n": len(a), "median_s": float(np.median(a)), "p75_s": float(np.percentile(a, 75)), "mean_s": float(a.mean())}
+
+
+def decision_vs_label(rows: list[dict]) -> dict:
+    """Kết luận của chuyên viên (đóng gian lận / hợp lệ) so với nhãn đến sau. rows: (status, is_fraud, n)."""
+    n = {(r["status"] == "CLOSED_FRAUD", bool(r["is_fraud"])): int(r["n"]) for r in rows}
+    tp, fp, fn, tn = (n.get(k, 0) for k in ((True, True), (True, False), (False, True), (False, False)))
+    total = tp + fp + fn + tn
+    return {"n": total, "agreement_rate": (tp + tn) / total if total else None,
+            "closed_fraud_label_fraud": tp, "closed_fraud_label_legit": fp,
+            "closed_legit_label_fraud": fn, "closed_legit_label_legit": tn}
 
 
 def product_metrics(conn) -> dict:
@@ -62,4 +77,5 @@ def product_metrics(conn) -> dict:
         "holdout_frac": settings.brief_holdout_frac,
         "brief_useful": {"n": len(allv), "useful_rate": (sum(allv) / len(allv)) if allv else None,
                          "by_source": {k: {"n": len(v), "useful_rate": sum(v) / len(v)} for k, v in useful.items()}},
+        "decision_vs_label": decision_vs_label(conn.execute(DECISION_SQL).fetchall()),
     }

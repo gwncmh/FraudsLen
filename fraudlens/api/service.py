@@ -15,7 +15,7 @@ from fraudlens.common.config import settings
 from fraudlens.common.db import J, audit, tx
 from fraudlens.common.features import FEATURE_SET_VERSION, compute, record_of
 from fraudlens.common.registry import load_json
-from fraudlens.common.routing import CASE_ROUTES, route
+from fraudlens.common.routing import CASE_ROUTES, UNSCORED, route
 from fraudlens.common.validation import validate
 
 log = logging.getLogger("fraudlens.api")
@@ -25,6 +25,9 @@ ROUTES = Counter("api_routes_total", "Số giao dịch theo luồng", ["route"])
 STATUS = Counter("api_score_status_total", "Trạng thái chấm điểm", ["status"])
 HIST_ERR = Counter("api_history_errors_total", "Lỗi đọc/ghi Redis")
 VALID_ERR = Counter("api_validation_errors_total", "Lỗi kiểm tra dữ liệu theo loại", ["code"])
+DUP_CONFLICT = Counter("api_duplicate_conflicts_total", "Gửi lại mã giao dịch đã có nhưng dữ liệu hỏng hoặc khác bản gốc")
+# Trường so khớp khi một mã giao dịch được gửi lại (sau khi tối thiểu hóa: card_hash thay số thẻ)
+DUP_FIELDS = ("event_ts", "card_hash", "amt", "merchant", "category")
 LOCK_WAIT = Histogram("api_card_lock_wait_seconds", "Thời gian chờ khóa theo thẻ",
                       buckets=(0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5))
 
@@ -43,13 +46,36 @@ class FastLane:
     @staticmethod
     def _existing(conn, trans_num: str) -> dict | None:
         r = conn.execute(
-            "SELECT t.trans_num, t.status AS txn_status, s.status, s.score, s.model_version, d.route, d.config_version, c.id AS case_id "
+            "SELECT t.trans_num, t.status AS txn_status, s.status, s.score, s.model_version, d.route, d.config_version, c.id AS case_id, "
+            "t.event_ts, t.card_hash, t.amt, t.merchant, t.category "
             "FROM transactions t LEFT JOIN scores s ON s.txn_id = t.id LEFT JOIN routing_decisions d ON d.txn_id = t.id "
             "LEFT JOIN cases c ON c.txn_id = t.id WHERE t.trans_num = %s", (trans_num,)).fetchone()
-        if r:
-            r = dict(r)
-            r["duplicate"] = True
-        return r
+        return dict(r) if r else None
+
+    def _duplicate(self, raw: dict, old: dict) -> dict:
+        """Mã giao dịch đã có. Gửi lại NGUYÊN VẸN -> trả kết quả đã lưu (idempotent).
+        Gửi lại mà payload hỏng hoặc khác bản gốc -> KHÔNG trả kết quả cũ (có thể là LOW): trả UNSCORED kèm lý do,
+        ghi audit DUPLICATE_CONFLICT; bản gốc và quyết định của nó giữ nguyên, không tạo hồ sơ mới (T-FAIL-01)."""
+        stored = {k: old.pop(k, None) for k in DUP_FIELDS}  # không trả card_hash ra ngoài
+        old["duplicate"] = True
+        if old["txn_status"] != "VALID":  # bản gốc lỗi (đã UNSCORED) hoặc lịch sử SEED: không có kết quả LOW để lộ ra
+            return old
+        # gửi lại thì không xét độ tươi theo đồng hồ luồng: giao dịch cũ gửi lại vẫn là giao dịch cũ
+        errors = validate(raw, self.categories)
+        if not errors:
+            m = pii.minimize(raw, self.key)
+            errors = [f"CONFLICT:{k}" for k in DUP_FIELDS if not _same(m[k], stored[k])]
+        if not errors:
+            return old
+        for e in errors:
+            VALID_ERR.labels(e).inc()
+        DUP_CONFLICT.inc()
+        original = {k: old.get(k) for k in ("txn_status", "status", "route", "score", "model_version", "config_version", "case_id")}
+        with tx() as conn:
+            audit(conn, "transaction", old["trans_num"], "DUPLICATE_CONFLICT", "system:api",
+                  {"errors": errors, "original_route": original["route"], "case_id": original["case_id"]})
+        return {"trans_num": old["trans_num"], "status": "DUPLICATE_CONFLICT", "route": UNSCORED, "score": None,
+                "errors": errors, "duplicate": True, "case_id": None, "original": original}
 
     def process(self, raw: dict) -> dict:
         t0 = time.perf_counter()
@@ -59,7 +85,7 @@ class FastLane:
             with tx() as conn:
                 old = self._existing(conn, tn)
             if old:
-                return old
+                return self._duplicate(raw, old)
 
         errors = validate(raw, self.categories, self.stream_ts, settings.max_future_s, settings.max_late_s)
         for e in errors:
@@ -99,10 +125,12 @@ class FastLane:
         t_med = self.rc["t_medium"] if self.rc else 1.0
         t_high = self.rc["t_high"] if self.rc else 1.0
         rt = route(sc["status"], sc.get("score"), t_med, t_high)
+        # độ trễ validation -> ML scoring -> routing (mục 4.2, không gồm LLM); lưu để dashboard tính p95
+        lat_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         try:
             with tx() as conn:
-                txn_id = self._write(conn, raw, tn, errors, m, feats, sc, rt, t_med, t_high)
+                txn_id = self._write(conn, raw, tn, errors, m, feats, sc, rt, t_med, t_high, lat_ms)
                 case_id = None
                 if rt in CASE_ROUTES:
                     case_id = conn.execute(
@@ -116,7 +144,7 @@ class FastLane:
             with tx() as conn:  # hai request trùng mã đến cùng lúc
                 old = self._existing(conn, tn)
             if old:
-                return old
+                return self._duplicate(raw, old)
             raise HTTPException(503, "xung đột ghi, hãy gửi lại")
         except Exception as e:  # noqa: BLE001 – chưa ghi được thì không trả kết quả
             log.exception("ghi PostgreSQL thất bại")
@@ -134,9 +162,10 @@ class FastLane:
         LAT.observe(time.perf_counter() - t0)
         return {"trans_num": tn, "status": sc["status"], "route": rt, "score": sc.get("score"),
                 "model_version": sc.get("model_version"), "config_version": self.rc and self.rc["config_version"],
-                "case_id": case_id, "duplicate": False, "latency_ms": round((time.perf_counter() - t0) * 1000, 2)}
+                "case_id": case_id, "duplicate": False, "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+                "routing_latency_ms": lat_ms}
 
-    def _write(self, conn, raw, tn, errors, m, feats, sc, rt, t_med, t_high) -> int:
+    def _write(self, conn, raw, tn, errors, m, feats, sc, rt, t_med, t_high, lat_ms=None) -> int:
         if m is None:  # payload lỗi: không lưu dữ liệu thô (có thể chứa thông tin cá nhân), chỉ lưu mã lỗi
             txn_id = conn.execute(
                 "INSERT INTO transactions (trans_num, status, validation_errors) VALUES (%s,'INVALID',%s) RETURNING id",
@@ -148,12 +177,23 @@ class FastLane:
                 "%(merchant)s,%(category)s,%(amt)s,%(city_pop)s,%(state)s,%(age)s,%(distance_km)s,'VALID') RETURNING id",
                 m).fetchone()["id"]
         conn.execute(
-            "INSERT INTO scores (txn_id, status, score_raw, score, model_version, feature_set_version, features, error) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO scores (txn_id, status, score_raw, score, model_version, feature_set_version, features, error, "
+            "latency_ms) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (txn_id, sc["status"], sc.get("score_raw"), sc.get("score"), sc.get("model_version"),
-             FEATURE_SET_VERSION if feats else None, J(feats) if feats else None, sc.get("error")))
+             FEATURE_SET_VERSION if feats else None, J(feats) if feats else None, sc.get("error"), lat_ms))
         conn.execute(
             "INSERT INTO routing_decisions (txn_id, route, config_version, t_medium, t_high) VALUES (%s,%s,%s,%s,%s)",
             (txn_id, rt, self.rc["config_version"] if self.rc else None, t_med, t_high))
         return txn_id
 
+
+def _same(a, b) -> bool:
+    """So một trường của payload gửi lại với bản đã lưu (amt lưu NUMERIC(14,2))."""
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+        try:
+            return abs(float(a) - float(b)) < 0.006
+        except (TypeError, ValueError):
+            return False
+    return str(a) == str(b)

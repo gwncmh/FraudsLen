@@ -86,6 +86,13 @@ function Report({ job }) {
         <StatCard title="Chạy tiếp từ offset" value={num(r.next_offset)} sub={r.stopped_early ? "đã dừng sớm" : "chạy hết"} icon={Gauge} />
       </div>
       <RouteSplit routes={r.routes} />
+      {r.labels && (
+        <p className="text-xs text-muted-foreground">
+          Nhãn trễ: đã gửi <b className="tabular text-foreground">{num(r.labels.sent)}</b>
+          {r.labels.failed > 0 && <> · <b className="tabular text-destructive">{num(r.labels.failed)} lỗi</b></>}
+          {" "}· còn <b className="tabular text-foreground">{num(r.labels.pending)}</b> chưa tới hạn (lần chạy tiếp theo gửi)
+        </p>
+      )}
       {r.faults_by_route && Object.keys(r.faults_by_route).length > 0 && (
         <div className="overflow-hidden rounded-lg border">
           <Table>
@@ -104,7 +111,7 @@ function Report({ job }) {
 
 export default function Simulator({ user }) {
   const [st, setSt] = useState(null);
-  const [form, setForm] = useState({ dataset: "test", limit: 2000, offset: "", tps: 20, threads: 4, fault_rate: 0.02, label_delay_days: 7, send_labels: true });
+  const [form, setForm] = useState({ dataset: "test", limit: 2000, offset: "", tps: 20, threads: 4, fault_rate: 0.02, label_delay_days: 7, send_labels: true, label_backfill: false });
   const [sel, setSel] = useState(null);
   const [busy, setBusy] = useState(false);
   const toast = useToast();
@@ -119,6 +126,7 @@ export default function Simulator({ user }) {
       const p = { ...form, ...(preset || {}) };
       const j = await api.startSimulator({ ...p, offset: p.offset === "" ? null : Number(p.offset) });
       toast(`Đã bắt đầu simulator #${j.id} (offset ${num(j.params.offset)})`);
+      setForm((f) => ({ ...f, label_backfill: false })); // gửi bù chỉ cần một lần
       reload();
     } catch (e) { toast(e.message, "error"); } finally { setBusy(false); }
   };
@@ -164,6 +172,7 @@ export default function Simulator({ user }) {
                 <Field label="Tỉ lệ payload lỗi"><Input type="number" step="0.01" min="0" max="1" value={form.fault_rate} onChange={set("fault_rate")} /></Field>
                 <Field label="Nhãn trễ (ngày)"><Input type="number" min="0" value={form.label_delay_days} onChange={set("label_delay_days")} /></Field>
                 <Field label="Gửi nhãn trễ"><div className="flex h-9 items-center"><Switch checked={form.send_labels} onCheckedChange={(v) => setForm({ ...form, send_labels: v })} /></div></Field>
+                <Field label="Gửi bù nhãn cũ (một lần)"><div className="flex h-9 items-center"><Switch checked={form.label_backfill} disabled={!form.send_labels} onCheckedChange={(v) => setForm({ ...form, label_backfill: v })} /></div></Field>
               </div>
               <Button disabled={busy || noData} onClick={() => start()}>{busy ? <Loader2 className="animate-spin" /> : <Play />}Bắt đầu</Button>
             </CardContent>

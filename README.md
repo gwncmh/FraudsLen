@@ -19,7 +19,9 @@ Nguồn giao dịch ──► API (làn nhanh) ──► Scorer (XGBoost) ─┐
    build image, **huấn luyện model trong Docker** nếu registry chưa có (tự chọn `--sample-cards` theo RAM máy; lần đầu
    15–30 phút), khởi động mọi dịch vụ và mở http://localhost:3000.
    Tùy chọn: `start.bat -Monitoring` (thêm Grafana), `start.bat -SampleCards 0.3`, `start.bat -Stop` (tắt).
-4. Trên web, bấm **Đăng ký** – tài khoản đầu tiên là **Admin**. Mọi bước còn lại làm trên giao diện:
+4. Cấp tài khoản Admin đầu tiên (ứng dụng nội bộ: **không tự đăng ký**, tài khoản do Admin cấp):
+   `docker compose exec api python -m fraudlens.tools.admin create-user admin admin` (in mật khẩu sinh ngẫu nhiên),
+   rồi đăng nhập ở http://localhost:3000. Mọi bước còn lại làm trên giao diện:
 
 Giao diện viết bằng React + Vite theo phong cách shadcn/ui (Tailwind CSS, Radix UI, framer-motion, recharts,
 lucide-react), có chế độ sáng / tối.
@@ -28,8 +30,8 @@ lucide-react), có chế độ sáng / tối.
 | --- | --- | --- |
 | **Dashboard** | KPI (giao dịch, HIGH/MEDIUM đang mở, tỉ lệ gắn cờ, p95 độ trễ, recall trên nhãn trễ); biểu đồ lưu lượng theo luồng (trực tiếp 60 phút / theo thời gian luồng); phân bố điểm rủi ro; **giao dịch bị gắn cờ** mở rộng để xem tín hiệu, yếu tố ảnh hưởng, hành vi thẻ; rule trigger; tổng quan an toàn (dịch vụ, drift); audit trail | mọi người |
 | **Giao dịch** | toàn bộ giao dịch: tìm theo mã / 4 số cuối thẻ / merchant, lọc theo luồng, dữ liệu lỗi, loại merchant, điểm; sắp xếp; phân trang; xuất CSV; bấm dòng để mở panel chi tiết (đồng hồ điểm, feature, yếu tố ảnh hưởng, link hồ sơ) | mọi người |
-| **Xử lý thủ công** | hàng đợi HIGH → MEDIUM → UNSCORED (tab Chuyển cấp, Đã đóng) bên trái, hồ sơ bên phải: Case Brief, điểm và giải thích, hành vi thẻ, lịch sử thao tác; khung **Quyết định** (gian lận / hợp lệ / điều tra / chuyển cấp / ghi nhận định / soạn lại brief), đóng xong tự sang hồ sơ kế tiếp | Analyst, Risk Lead |
-| **Simulator** | `tools.simulator`: nút chạy nhanh hoặc tùy chỉnh; tiến độ, tốc độ, độ trễ, phân luồng trực tiếp, nút **Dừng**; tự chạy tiếp từ offset lần trước; T-FAIL-01 và lịch sử các lần chạy | Risk Lead, Admin |
+| **Xử lý thủ công** | hàng đợi HIGH → MEDIUM → UNSCORED (tab Chuyển cấp, Đã đóng) bên trái, hồ sơ bên phải: Case Brief, điểm và giải thích, hành vi thẻ, lịch sử thao tác; khung **Quyết định** (gian lận / hợp lệ / lỗi dữ liệu – chỉ với payload lỗi / điều tra / chuyển cấp / ghi nhận định / soạn lại brief), đóng xong tự sang hồ sơ kế tiếp | Analyst, Risk Lead |
+| **Simulator** | `tools.simulator`: nút chạy nhanh hoặc tùy chỉnh; tiến độ, tốc độ, độ trễ, phân luồng trực tiếp, nút **Dừng**; tự chạy tiếp từ offset lần trước; nhãn trễ đã gửi / còn nợ lần sau; T-FAIL-01 và lịch sử các lần chạy | Risk Lead, Admin |
 | **Model** | `ml.approve`: số đo val_B, release gate, bấm *Duyệt và kích hoạt* (gate chặn thì nhập lý do override). Scorer và API **tự nạp model mới trong ~2 giây** | Risk Lead |
 | **Cài đặt → Hệ thống** | checklist cài đặt, trạng thái dịch vụ; nút *Nạp lịch sử*, *Dựng lại Redis*, *Kiểm tra audit*, *Offline = online*, *Truy vết toàn bộ*, *Kiểm tra LLM*, *Soạn lại brief*, *Chấm brief*; truy vết một giao dịch; job gần đây | Admin (một số nút cho Risk Lead) |
 | **Cài đặt → Người dùng / Audit trail / Tài khoản / Giao diện** | quản lý tài khoản và vai trò; nhật ký audit có tìm kiếm và kiểm tra chuỗi băm; đổi mật khẩu; sáng / tối | theo vai trò |
@@ -42,8 +44,8 @@ Kịch bản demo cập nhật tiến độ (≤ 5 phút, thao tác + lời dẫ
 Phát triển giao diện không cần Docker: `cd frontend; npm install; npm run dev` (mở http://localhost:5173, gọi API ở cổng 8000).
 
 Tài khoản: mật khẩu băm PBKDF2-SHA256, phiên đăng nhập lưu băm SHA-256 của token (bảng `app_users`, `app_sessions`).
-`ALLOW_REGISTRATION=false` trong `.env` để chỉ Admin tạo tài khoản. Token tĩnh `DASHBOARD_TOKENS` vẫn đăng nhập được
-(link "Đăng nhập bằng token tĩnh"). Việc chạy lâu là **job nền** trong tiến trình API, trạng thái lưu ở bảng `ops_jobs`.
+Không có tự đăng ký và không có token tĩnh: Admin cấp tài khoản ở **Cài đặt → Người dùng** hoặc bằng lệnh
+`create-user <tên> <analyst|risk_lead|admin> [--name "Họ tên"] [--password ...]` (xem mục 4). Việc chạy lâu là **job nền** trong tiến trình API, trạng thái lưu ở bảng `ops_jobs`.
 Đổi LLM vẫn sửa `.env` rồi chạy lại `start.bat` (worker đọc lại cấu hình). Các lệnh dòng lệnh ở mục 4 vẫn dùng được
 như cũ; kiểm thử tải lớn nên chạy simulator bằng Python trên máy (simulator trên web chạy chung tiến trình với API).
 
@@ -59,13 +61,13 @@ như cũ; kiểm thử tải lớn nên chạy simulator bằng Python trên má
 | `fraudlens\common\registry.py` | Model registry + cấu hình ngưỡng có phiên bản |
 | `fraudlens\ml\` | Huấn luyện XGBoost, hiệu chỉnh Platt, chọn ngưỡng theo năng lực review, duyệt, chạy test một lần |
 | `fraudlens\scorer\app.py` | Scorer – tiến trình riêng |
-| `fraudlens\api\` | API: làn nhanh, Redis, gọi Scorer có ngắt mạch, endpoint cho dashboard; `accounts.py` đăng ký/đăng nhập; `ops.py` job nền (simulator, nạp lịch sử...), trạng thái hệ thống, duyệt model |
+| `fraudlens\api\` | API: làn nhanh, Redis, gọi Scorer có ngắt mạch, endpoint cho dashboard; `accounts.py` đăng nhập, cấp tài khoản; `ops.py` job nền (simulator, nạp lịch sử...), trạng thái hệ thống, duyệt model |
 | `start.ps1`, `start.bat` | Cài đặt + huấn luyện (trong Docker) + khởi động bằng một lệnh |
 | `fraudlens\worker\` | LLM worker: outbox, BM25, gọi LLM, kiểm tra brief, brief mẫu |
 | `fraudlens\monitor\` | Giám sát PSI và chất lượng trên nhãn trễ |
 | `fraudlens\tools\` | Simulator, nạp lịch sử, lệnh quản trị (truy vết, kiểm tra audit, kiểm tra LLM) |
-| `frontend\` | Giao diện web React: đăng nhập/đăng ký, tổng quan, hàng đợi, hồ sơ, simulator, model, hệ thống, người dùng |
-| `db\schema.sql` | Lược đồ cơ sở dữ liệu |
+| `frontend\` | Giao diện web React: đăng nhập, tổng quan, hàng đợi, hồ sơ, simulator, model, hệ thống, người dùng |
+| `db\schema.sql` | Lược đồ cơ sở dữ liệu – nguồn duy nhất, chạy lại được; API áp dụng lại mỗi lần khởi động |
 | `kb\playbook.md` | Playbook bản nháp (thay khi có playbook chính thức) |
 | `tests\` | Kiểm thử không cần cơ sở dữ liệu |
 
@@ -269,38 +271,76 @@ Cuối mỗi lần chạy, simulator in độ trễ p50/p95/p99, số giao dịc
 Kết quả đúng: số giao dịch UNSCORED bằng số lỗi tiêm vào trừ lỗi `duplicate` (bản gửi trùng nhận lại kết quả cũ),
 không có giao dịch lỗi nào thành LOW.
 
+**Nhãn trễ.** Nhãn `is_fraud` chỉ được gửi khi luồng đã đi qua thời điểm giao dịch + 7 ngày. Một lần chạy 2.000 giao
+dịch chỉ phủ chưa tới 1 ngày của bộ dữ liệu, nên phần lớn nhãn do các **lần chạy sau** gửi: mỗi lần chạy tính lại từ
+file CSV những nhãn còn nợ của các dòng trước `--offset` (dòng "Nhãn trễ: đã gửi … còn … chưa tới hạn"); phát hết file
+thì gửi nốt. Recall trên nhãn trễ vì vậy chỉ có sau khi đã phát lại hơn 7 ngày dữ liệu (~19.000 giao dịch).
+Dữ liệu đã phát lại bằng bản cũ (bản đó bỏ mất nhãn chưa tới hạn) thì gửi bù một lần:
+
+```powershell
+python -m fraudlens.tools.simulator --offset <offset chạy tiếp> --limit 2000 --label-backfill
+```
+
+(trên web: bật "Gửi bù nhãn cũ" ở khung Tùy chỉnh của trang Simulator).
+
 ### Bước 9 – Làm việc trên dashboard
 
-Mở http://localhost:3000, **đăng ký / đăng nhập** bằng tài khoản (tài khoản đầu tiên là Admin, Admin cấp vai trò
-ở trang Người dùng), hoặc bấm "Đăng nhập bằng token tĩnh" và dùng token trong `.env`:
-`analyst-token` (Fraud Analyst), `lead-token` (Risk Lead), `admin-token` (Admin).
+Mở http://localhost:3000 và **đăng nhập** bằng tài khoản được cấp (Fraud Analyst / Risk Lead / Admin). Admin tạo
+tài khoản, đổi vai trò, khóa hoặc đặt lại mật khẩu ở **Cài đặt → Người dùng**; mỗi người tự đổi mật khẩu ở
+**Cài đặt → Tài khoản**. Xem danh sách tài khoản từ dòng lệnh: `python -m fraudlens.tools.admin list-users`.
 
 Hàng đợi xếp HIGH → MEDIUM → UNSCORED, trong mỗi mức theo điểm rồi số tiền. Mở hồ sơ để xem giao dịch, điểm, ngưỡng,
 yếu tố ảnh hưởng, Case Brief; ghi nhận định, điều tra thêm, chuyển cấp hoặc đóng (đóng bắt buộc có nhận định).
+
+- Hồ sơ **đã chuyển cấp** thuộc về Risk Lead cho tới khi đóng: chuyên viên chỉ còn ghi thêm nhận định, không đổi trạng
+  thái hay đóng được (kể cả khi Risk Lead đã chuyển nó sang "Đang điều tra").
+- Hồ sơ của **payload lỗi** (không có số tiền, thẻ để xem) có thêm nút "Lỗi dữ liệu – không kết luận được"
+  (`CLOSED_INVALID`), để không phải ép chọn gian lận/hợp lệ.
 
 ### Bước 10 – Bật LLM soạn Case Brief
 
 Không cấu hình LLM thì worker dùng **brief dạng mẫu**, mọi bước khác vẫn chạy đủ. Hồ sơ **UNSCORED luôn dùng brief mẫu**
 (không có điểm để giải thích) – đây là thiết kế, không phải lỗi. Code gọi mọi nhà cung cấp có API tương thích OpenAI,
-nên đổi LLM chỉ cần sửa vài dòng trong `.env`. Chọn **một** trong ba cách:
+nên đổi LLM chỉ cần sửa vài dòng trong `.env`. Mặc định là **Qwen chạy trên máy bằng Ollama** (Cách A, miễn phí);
+muốn dùng nhà cung cấp khác thì chọn **một** trong các cách còn lại:
 
-**Cách A – Ollama chạy trên máy (không giới hạn lượt gọi, dữ liệu không rời máy, chậm hơn).**
+**Cách A – Qwen chạy trên máy bằng Ollama (mặc định; miễn phí, không giới hạn lượt gọi, dữ liệu không rời máy).**
 
 1. Tải và cài Ollama for Windows ở ollama.com (cài xong tự chạy nền).
-2. `ollama pull qwen2.5:3b` (máy 16 GB có thể dùng `qwen2.5:7b`, viết tốt hơn, tốn ~5 GB RAM).
-3. Trong `.env`:
+2. `ollama pull qwen2.5:7b` (~4,7 GB, cần ~6 GB RAM trống). Máy 8 GB RAM dùng `qwen2.5:3b`: nhanh gấp đôi nhưng
+   brief hay bị bộ kiểm tra loại hơn.
+3. Trong `.env` (đã là mặc định của `.env.example`):
    ```
    LLM_BASE_URL=http://host.docker.internal:11434/v1
    LLM_API_KEY=ollama
-   LLM_MODEL=qwen2.5:3b
-   LLM_TEMPERATURE=0
+   LLM_MODEL=qwen2.5:7b
    LLM_TIMEOUT_S=180
    LLM_MIN_INTERVAL_S=0
    ```
-   `LLM_API_KEY` chỉ cần khác rỗng. Khi chạy các lệnh kiểm tra bên dưới (chạy trên máy, ngoài Docker),
-   tạm đổi dòng đầu thành `http://localhost:11434/v1`, kiểm tra xong đổi lại `host.docker.internal`.
+   `LLM_API_KEY` chỉ cần khác rỗng (để trống = tắt LLM). Lệnh kiểm tra chạy trên máy (ngoài Docker) tự đổi
+   `host.docker.internal` thành `localhost`, không phải sửa `.env`. Chạy trên CPU nên mỗi brief mất cỡ nửa phút đến
+   một phút: không ảnh hưởng chấm điểm hay phân luồng (brief soạn ở làn chậm), chỉ là brief hiện ra muộn hơn.
+   Dùng `qwen3:4b`/`qwen3:8b` cũng được: khối `<think>…</think>` model trả kèm được tự bỏ trước khi kiểm tra brief.
+4. Máy chỉ có GPU tích hợp (AMD Radeon 7xxM, Intel Arc...): Ollama mặc định bỏ qua nó và chạy CPU (`ollama ps` ghi
+   `100% CPU`). Bật bằng `setx OLLAMA_IGPU_ENABLE 1`, thoát Ollama ở khay hệ thống rồi mở lại; `ollama ps` phải ghi
+   `100% GPU`. Đo trên Ryzen 7 8845HS / Radeon 780M: ~47 giây/brief thay vì ~93 giây, và không chiếm CPU của API.
 
-**Cách B – Groq (cloud, miễn phí có giới hạn theo ngày, chất lượng tốt hơn).**
+**Cách B – Qwen trên Alibaba Cloud Model Studio (cloud, nhanh; trả phí sau hạn mức miễn phí cho tài khoản mới).**
+
+1. Đăng ký Alibaba Cloud, mở **Model Studio** (vùng Singapore), tạo API key.
+2. Trong `.env`:
+   ```
+   LLM_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+   LLM_API_KEY=<key Model Studio, dạng sk-...>
+   LLM_MODEL=qwen-plus
+   LLM_TIMEOUT_S=20
+   LLM_MIN_INTERVAL_S=1
+   ```
+   `qwen-flash` rẻ và nhanh hơn, `qwen-max` viết tốt hơn nhưng đắt và chậm hơn. Key gắn với vùng: key tạo ở vùng
+   Bắc Kinh thì dùng `https://dashscope.aliyuncs.com/compatible-mode/v1` (sai vùng báo lỗi 401). Code tự gửi
+   `enable_thinking=false` khi gọi DashScope (Qwen3 bắt buộc tắt chế độ suy nghĩ khi không streaming).
+
+**Cách C – Groq (cloud, miễn phí có giới hạn theo ngày, chất lượng tốt hơn).**
 
 1. Đăng ký ở console.groq.com, tạo API key, xem hạn mức ở trang Limits.
 2. Trong `.env`:
@@ -308,10 +348,11 @@ nên đổi LLM chỉ cần sửa vài dòng trong `.env`. Chọn **một** tron
    LLM_BASE_URL=https://api.groq.com/openai/v1
    LLM_API_KEY=<key Groq>
    LLM_MODEL=openai/gpt-oss-120b
+   LLM_TIMEOUT_S=20
    LLM_MIN_INTERVAL_S=20
    ```
 
-**Cách C – Gemini Flash-Lite (Google AI Studio).**
+**Cách D – Gemini Flash-Lite (Google AI Studio).**
 
 1. Tạo API key ở Google AI Studio.
 2. Trong `.env`:
@@ -319,15 +360,15 @@ nên đổi LLM chỉ cần sửa vài dòng trong `.env`. Chọn **một** tron
    LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
    LLM_API_KEY=<key Gemini>
    LLM_MODEL=gemini-3.5-flash-lite
-   LLM_TEMPERATURE=
+   LLM_TIMEOUT_S=20
    LLM_MIN_INTERVAL_S=4
    ```
    Lỗi 404 nghĩa là key không được dùng tên model đó – xem tên đúng bằng lệnh `list-models` bên dưới.
 
-**Sau khi sửa `.env` (cả ba cách):**
+**Sau khi sửa `.env` (mọi cách):**
 
 ```powershell
-python -m fraudlens.tools.admin list-models --all     # tên model key/nhà cung cấp này cho dùng
+python -m fraudlens.tools.admin list-models --all     # tên model key/nhà cung cấp này cho dùng (lọc theo họ của LLM_MODEL)
 python -m fraudlens.tools.admin test-llm              # phải in "OK"
 python -m fraudlens.tools.admin test-brief            # soạn thử 1 brief, phải ra "brief_source": "llm"
 docker compose up -d --force-recreate worker          # worker đọc lại .env
@@ -336,7 +377,7 @@ docker compose logs worker -f                         # thấy "brief llm" là �
 ```
 
 Ý nghĩa lỗi của `test-llm`: `HTTP 400/401/403` sai key · `HTTP 404` sai tên model · `HTTP 429` hết hạn mức (đợi rồi thử lại) ·
-`ConnectError` sai `LLM_BASE_URL` hoặc Ollama chưa chạy. Nếu `test-brief` ra `fallback`, mục `guardrail.rejections`
+`ConnectError` sai `LLM_BASE_URL` hoặc Ollama chưa chạy · `ReadTimeout` model chạy quá chậm: tăng `LLM_TIMEOUT_S` hoặc dùng model nhỏ hơn. Nếu `test-brief` ra `fallback`, mục `guardrail.rejections`
 ghi lý do brief bị bộ kiểm tra loại; dashboard cũng hiện lý do này dưới brief.
 
 ### Bước 11 – Giám sát
@@ -409,7 +450,7 @@ chi tiết confusion matrix, Brier/ECE, slice cho model và từng mốc.
 
 ```powershell
 python -m fraudlens.tools.admin eval-briefs 200 --export briefs_eval.csv   # tỉ lệ nhận định có căn cứ (mục tiêu ≥ 90%)
-python -m fraudlens.tools.admin product-metrics                            # thời gian xử lý, tỉ lệ brief hữu ích
+python -m fraudlens.tools.admin product-metrics                            # thời gian xử lý, tỉ lệ brief hữu ích, kết luận của chuyên viên so với nhãn trễ
 ```
 
 - `eval-briefs` chấm từng nhận định (summary, risk_signals) của brief đã lưu: có trường căn cứ hợp lệ, mọi con số có
@@ -457,11 +498,11 @@ API kiểm tra phiên bản model mà Scorer trả về phải khớp với cấ
 | Scorer khởi động lại liên tục | Chưa có `registry\ACTIVE` – làm bước 4 và 5 trước khi `docker compose up` |
 | Mọi giao dịch đều UNSCORED | Xem `docker compose logs api` và `docker compose logs scorer`: chưa duyệt ngưỡng, Scorer chưa chạy, hoặc model khác cấu hình |
 | Brief luôn là dạng mẫu | Chạy `python -m fraudlens.tools.admin test-llm` và `test-brief` (bước 10); xem `docker compose logs worker` |
-| Dashboard báo token không hợp lệ | Token phải khớp `DASHBOARD_TOKENS` trong `.env`; sửa xong chạy `docker compose up -d api` |
+| Không đăng nhập được / quên mật khẩu | Admin đặt lại mật khẩu ở Cài đặt → Người dùng; chưa có tài khoản nào thì chạy `create-user` (mục 4) |
 
 ## 8. Những gì là bản đồ án, chưa phải bản vận hành thật
 
-- Đăng nhập dashboard bằng token tĩnh trong `.env` (cơ chế thật sẽ chốt khi hiện thực; chỉ cần thay `fraudlens\api\auth.py`).
+- Đăng nhập bằng tài khoản nội bộ lưu trong PostgreSQL; chưa nối SSO/LDAP của công ty (chỉ cần thay `fraudlens\api\auth.py`).
 - Một máy, PostgreSQL và Redis là điểm lỗi đơn (Giai đoạn 1). Giai đoạn 2 trong báo cáo thêm bản sao và máy riêng.
 - Playbook là bản nháp `draft-0`.
 - Chuỗi băm audit dùng một khóa chung (đủ cho Mức 1–2; Mức 3 chuyển sang chuỗi theo phân vùng).

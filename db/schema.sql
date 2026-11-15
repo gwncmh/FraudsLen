@@ -1,5 +1,6 @@
 -- FraudLens – lược đồ PostgreSQL (nguồn sự thật duy nhất)
--- Tự chạy khi container Postgres khởi tạo lần đầu; chạy tay: psql "$DATABASE_URL" -f db/schema.sql
+-- Chạy lại được nhiều lần (idempotent): Postgres chạy khi khởi tạo lần đầu, API chạy lại mỗi lần khởi động để DB
+-- tạo từ bản cũ được bổ sung bảng/cột/ràng buộc mới. Chạy tay: psql "$DATABASE_URL" -f db/schema.sql
 
 CREATE TABLE IF NOT EXISTS transactions (
     id                BIGSERIAL PRIMARY KEY,
@@ -48,12 +49,22 @@ CREATE TABLE IF NOT EXISTS cases (
     txn_id         BIGINT UNIQUE NOT NULL REFERENCES transactions(id),
     route          TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'OPEN'
-                   CHECK (status IN ('OPEN','INVESTIGATING','ESCALATED','CLOSED_FRAUD','CLOSED_LEGIT')),
+                   CHECK (status IN ('OPEN','INVESTIGATING','ESCALATED','CLOSED_FRAUD','CLOSED_LEGIT','CLOSED_INVALID')),
     assigned_role  TEXT NOT NULL DEFAULT 'analyst',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_cases_queue ON cases (status, route, created_at);
+-- DB tạo từ bản schema cũ: thêm trạng thái CLOSED_INVALID (đóng hồ sơ của payload lỗi mà không ép kết luận gian lận/hợp lệ)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cases_status_check' AND conrelid = 'cases'::regclass
+               AND pg_get_constraintdef(oid) NOT LIKE '%CLOSED_INVALID%') THEN
+        ALTER TABLE cases DROP CONSTRAINT cases_status_check;
+        ALTER TABLE cases ADD CONSTRAINT cases_status_check
+            CHECK (status IN ('OPEN','INVESTIGATING','ESCALATED','CLOSED_FRAUD','CLOSED_LEGIT','CLOSED_INVALID'));
+    END IF;
+END $$;
 
 -- Hàng đợi soạn brief (outbox): ghi cùng transaction với hồ sơ nên không thể mất việc
 CREATE TABLE IF NOT EXISTS brief_jobs (
@@ -115,7 +126,7 @@ CREATE TABLE IF NOT EXISTS monitor_metrics (
     owner         TEXT,                        -- người chịu trách nhiệm khi có cảnh báo
     action        TEXT                         -- việc cần làm khi có cảnh báo
 );
--- DB tạo từ bản schema cũ: thêm cột (monitor cũng tự chạy lệnh này khi khởi động)
+-- DB tạo từ bản schema cũ: thêm cột
 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS owner TEXT;
 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS action TEXT;
 
@@ -138,8 +149,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_audit_no_update ON audit_log;
-CREATE TRIGGER trg_audit_no_update BEFORE UPDATE OR DELETE ON audit_log
+CREATE OR REPLACE TRIGGER trg_audit_no_update BEFORE UPDATE OR DELETE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION audit_log_readonly();
 
 -- Tài khoản đăng nhập web (mật khẩu băm PBKDF2, phiên lưu băm SHA-256 của token)

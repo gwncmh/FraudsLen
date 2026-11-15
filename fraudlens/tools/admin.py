@@ -1,5 +1,8 @@
 """Lệnh quản trị nhỏ.
 
+  python -m fraudlens.tools.admin create-user <tên> <analyst|risk_lead|admin> [--name "Họ tên"] [--password <mk>]
+                                                    # cấp tài khoản web (không có --password: tự sinh và in ra một lần)
+  python -m fraudlens.tools.admin list-users        # liệt kê tài khoản web
   python -m fraudlens.tools.admin rebuild-redis     # dựng lại lịch sử thẻ trong Redis từ PostgreSQL
   python -m fraudlens.tools.admin verify-audit      # kiểm tra chuỗi băm của nhật ký audit
   python -m fraudlens.tools.admin trace <trans_num> # truy vết một giao dịch: điểm, ngưỡng, hồ sơ, brief, thao tác, audit
@@ -10,7 +13,9 @@
   python -m fraudlens.tools.admin regen-briefs      # soạn lại brief cho mọi hồ sơ MEDIUM/HIGH đang mở
   python -m fraudlens.tools.admin check-parity [N]  # so feature online với offline trên N giao dịch gần nhất (mặc định 20000)
   python -m fraudlens.tools.admin product-metrics   # thời gian xử lý hồ sơ có/không có brief LLM, tỉ lệ brief hữu ích
-  python -m fraudlens.tools.admin eval-briefs [N]   # chấm N brief gần nhất theo rubric "nhận định có căn cứ" (mục tiêu ≥ 90%)
+  python -m fraudlens.tools.admin eval-briefs [N] [--export f.csv]   # chấm N brief gần nhất theo rubric "nhận định có căn cứ"
+                                                    # (mục tiêu ≥ 90%); --export ghi CSV để NGƯỜI chấm cột human_grounded
+  python -m fraudlens.tools.admin eval-briefs --import f.csv         # tỉ lệ có căn cứ theo người chấm + độ khớp với rubric
   python -m fraudlens.tools.admin report --version <v> [--out reports/<v>] [--replay replay_report.json] [--db]
                                                     # gom số đo thành report.md + hình cho báo cáo (xem tools/report.py)
 """
@@ -25,7 +30,27 @@ from fraudlens.common.db import close_pool, tx, verify_audit_chain
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "rebuild-redis":
+    if cmd == "create-user" and len(sys.argv) > 3:
+        import secrets
+        from fastapi import HTTPException
+        from fraudlens.api.accounts import provision_user
+        opt = lambda k: sys.argv[sys.argv.index(k) + 1] if k in sys.argv[:-1] else None  # noqa: E731
+        username, role, pw = sys.argv[2], sys.argv[3], opt("--password")
+        generated = pw is None
+        if generated:  # đủ luật mật khẩu: ≥ 8 ký tự, có chữ và số
+            pw = secrets.token_urlsafe(9) + "a7"
+        try:
+            with tx() as conn:
+                u = provision_user(conn, username, pw, role, opt("--name"), "cli:admin")
+        except HTTPException as e:
+            raise SystemExit(f"không tạo được: {e.detail}") from None
+        print(f"đã tạo {u['username']} ({u['role']})" + (f" – mật khẩu: {pw}" if generated else ""))
+    elif cmd == "list-users":
+        with tx() as conn:
+            for u in conn.execute("SELECT id, username, display_name, role, active, last_login_at FROM app_users ORDER BY id"):
+                print(f"{u['id']:>3}  {u['username']:<20} {u['role']:<10} {'hoạt động' if u['active'] else 'KHÓA':<10} "
+                      f"{u['display_name']}  (đăng nhập cuối: {u['last_login_at'] or '-'})")
+    elif cmd == "rebuild-redis":
         h = HistoryStore()
         h.r.delete(WARM_FLAG)
         with tx() as conn:
@@ -75,13 +100,17 @@ def main():
     elif cmd == "list-models":
         import httpx
         from fraudlens.common.config import settings
-        r = httpx.get(settings.llm_base_url.rstrip("/") + "/models",
+        from fraudlens.worker.llm import local_base
+        r = httpx.get(local_base(settings.llm_base_url.rstrip("/")) + "/models",
                       headers={"Authorization": f"Bearer {settings.llm_api_key.strip()}"}, timeout=20)
         if r.status_code != 200:
             raise SystemExit(f"LỖI HTTP {r.status_code}: {r.text[:400]}")
         ids = sorted(m["id"].removeprefix("models/") for m in r.json().get("data", []))
-        lite = [i for i in ids if "lite" in i]
-        print("Model Flash-Lite dùng được:", *(lite or ["(không có)"]), sep="\n  ")
+        # cùng họ với LLM_MODEL đang đặt (qwen-plus -> mọi model "qwen..."), để chọn tên đúng khi gặp lỗi 404
+        family = settings.llm_model.split("-")[0].split(":")[0].split("/")[-1].lower()
+        same = [i for i in ids if family and family in i.lower()]
+        print(f"Model họ '{family}' dùng được (LLM_MODEL = {settings.llm_model}"
+              f"{'' if settings.llm_model in ids else ' – KHÔNG có trong danh sách'}):", *(same or ["(không có)"]), sep="\n  ")
         print(f"\n(tổng cộng {len(ids)} model; chạy với --all để xem hết)")
         if "--all" in sys.argv:
             print(*ids, sep="\n")
@@ -119,8 +148,11 @@ def main():
         with tx() as conn:
             print(json.dumps(product_metrics(conn), indent=2, ensure_ascii=False, default=str))
     elif cmd == "eval-briefs":
-        from fraudlens.worker.evaluate import evaluate_db
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+        from fraudlens.worker.evaluate import evaluate_db, human_agreement
+        if "--import" in sys.argv:  # file --export đã được người chấm điền cột human_grounded (không cần DB)
+            print(json.dumps(human_agreement(sys.argv[sys.argv.index("--import") + 1]), indent=2, ensure_ascii=False))
+            return
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 200
         export = sys.argv[sys.argv.index("--export") + 1] if "--export" in sys.argv else None
         with tx() as conn:
             rep = evaluate_db(conn, limit, export)

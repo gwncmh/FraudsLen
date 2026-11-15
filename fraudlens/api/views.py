@@ -6,12 +6,14 @@ Nhãn is_fraud (labels_eval) chỉ dùng ở dạng tổng hợp (recall/precisi
 from __future__ import annotations
 
 import math
+import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from fraudlens.api.auth import User, current_user, require_role
 from fraudlens.common.db import tx
+from fraudlens.tools.product import is_holdout
 
 router = APIRouter(prefix="/v1")
 
@@ -33,6 +35,21 @@ def as_list(v) -> list:
 
 
 SCORE_BINS = [0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0000001]
+
+# Nhãn trễ theo luồng (dùng chung cho /v1/dashboard và /v1/stats). Chỉ tính giao dịch VALID: nhãn của payload lỗi
+# (đã thành UNSCORED cho người xem) không nói gì về model nên không được kéo recall xuống.
+LABELS_BY_ROUTE_SQL = (
+    "SELECT d.route, l.is_fraud, count(*) AS n FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
+    "AND t.status = 'VALID' JOIN routing_decisions d ON d.txn_id = t.id GROUP BY d.route, l.is_fraud")
+
+_categories = {"at": 0.0, "items": []}  # danh sách category cho bộ lọc: quét cả bảng nên chỉ đọc lại mỗi phút
+
+
+def _category_list(conn) -> list[str]:
+    if not _categories["items"] or time.monotonic() - _categories["at"] > 60:
+        rows = conn.execute("SELECT DISTINCT category FROM transactions WHERE category IS NOT NULL ORDER BY 1").fetchall()
+        _categories.update(at=time.monotonic(), items=[r["category"] for r in rows])
+    return _categories["items"]
 
 
 # ------------------------------------------------------------------ dashboard tổng
@@ -68,9 +85,7 @@ def dashboard(window: Literal["live", "stream"] = "live", user: User = Depends(c
             "SELECT status, count(*) AS n FROM cases WHERE status LIKE 'CLOSED%%' GROUP BY status").fetchall()
         scores = conn.execute(
             "SELECT score FROM scores WHERE status = 'SCORED' ORDER BY txn_id DESC LIMIT 5000").fetchall()
-        labels = conn.execute(
-            "SELECT d.route, l.is_fraud, count(*) AS n FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
-            "JOIN routing_decisions d ON d.txn_id = t.id GROUP BY d.route, l.is_fraud").fetchall()
+        labels = conn.execute(LABELS_BY_ROUTE_SQL).fetchall()
         # "rule trigger": lỗi kiểm tra dữ liệu, lỗi chấm điểm, yếu tố đẩy rủi ro lên trong các brief gần đây
         validation = conn.execute(
             f"SELECT e AS code, count(*) AS n FROM (SELECT {ERRS_SQL.format(c='validation_errors')} AS errs FROM transactions "
@@ -115,6 +130,9 @@ def dashboard(window: Literal["live", "stream"] = "live", user: User = Depends(c
     for f in flagged:
         f["validation_errors"] = errors_of(f["validation_errors"])
         f["factors"], f["risk_signals"] = as_list(f["factors"]), as_list(f["risk_signals"])
+        f["brief_holdout"] = is_holdout(f["case_id"])
+        if f["brief_holdout"]:  # nhóm đối chứng: không lộ nội dung brief qua đường khác (xem get_case)
+            f["risk_signals"], f["brief_source"] = [], None
     frauds = sum(r["n"] for r in labels if r["is_fraud"])
     caught = sum(r["n"] for r in labels if r["is_fraud"] and r["route"] in ("HIGH", "MEDIUM"))
     flagged_lab = sum(r["n"] for r in labels if r["route"] in ("HIGH", "MEDIUM"))
@@ -170,8 +188,8 @@ def list_transactions(route: str | None = None, status: str | None = None, q: st
             (*args, min(max(limit, 1), 200), max(offset, 0))).fetchall()
         for r in rows:
             r["validation_errors"] = errors_of(r["validation_errors"])
-        cats = conn.execute("SELECT DISTINCT category FROM transactions WHERE category IS NOT NULL ORDER BY 1").fetchall()
-    return {"items": rows, "total": total, "categories": [r["category"] for r in cats]}
+        cats = _category_list(conn)
+    return {"items": rows, "total": total, "categories": cats}
 
 
 @router.get("/transactions/{txn_id}")
@@ -193,6 +211,8 @@ def get_transaction(txn_id: int, user: User = Depends(current_user)):
                                  "WHERE case_id = %s ORDER BY id DESC LIMIT 1", (t["case_id"],)).fetchone()
             if brief:
                 brief["factors"], brief["risk_signals"] = as_list(brief["factors"]), as_list(brief["risk_signals"])
+                if is_holdout(t["case_id"]):
+                    brief["risk_signals"], brief["brief_source"] = [], None
     return {"transaction": t, "brief": brief}
 
 

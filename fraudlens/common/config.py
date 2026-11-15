@@ -41,11 +41,7 @@ class Settings:
     # Bảo vệ dữ liệu
     hmac_key: str = field(default_factory=lambda: _env("HMAC_KEY", ""))
     source_api_key: str = field(default_factory=lambda: _env("SOURCE_API_KEY", "dev-source-key"))
-    # Đăng nhập dashboard (bản demo): "tên:token:vai_trò,..." – cơ chế thật sẽ chốt khi hiện thực
-    dashboard_tokens: str = field(default_factory=lambda: _env(
-        "DASHBOARD_TOKENS", "analyst:analyst-token:analyst,lead:lead-token:risk_lead,admin:admin-token:admin"))
-    # Tài khoản trên web: cho phép tự đăng ký (tài khoản đầu tiên thành admin), thời hạn phiên đăng nhập
-    allow_registration: bool = field(default_factory=lambda: _env("ALLOW_REGISTRATION", "true").lower() in ("1", "true", "yes"))
+    # Tài khoản web do Admin cấp (không tự đăng ký, không token tĩnh); thời hạn phiên đăng nhập
     session_ttl_h: int = field(default_factory=lambda: _int("SESSION_TTL_H", 168))
     # Thư mục chứa fraudTrain.csv / fraudTest.csv (simulator và nạp lịch sử chạy từ giao diện web)
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "data")))
@@ -68,12 +64,18 @@ class Settings:
     max_late_s: int = field(default_factory=lambda: _int("MAX_LATE_S", 86400))
 
     # Làn chậm
-    llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
+    # Mặc định: Qwen 2.5 7B chạy trên máy bằng Ollama (miễn phí) qua API tương thích OpenAI. LLM_API_KEY vẫn phải
+    # khác rỗng (Ollama bỏ qua giá trị) – để trống nghĩa là tắt LLM, worker dùng brief mẫu.
+    llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "http://host.docker.internal:11434/v1"))
     llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY", ""))
-    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "gemini-2.5-flash-lite"))
-    llm_timeout_s: float = field(default_factory=lambda: _float("LLM_TIMEOUT_S", 20.0))
-    llm_retries: int = field(default_factory=lambda: _int("LLM_RETRIES", 1))
-    llm_min_interval_s: float = field(default_factory=lambda: _float("LLM_MIN_INTERVAL_S", 4.0))
+    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "qwen2.5:7b"))
+    llm_timeout_s: float = field(default_factory=lambda: _float("LLM_TIMEOUT_S", 180.0))  # model chạy CPU: chậm
+    llm_retries: int = field(default_factory=lambda: _int("LLM_RETRIES", 1))  # sinh lại khi brief không qua guardrail
+    # Lỗi tạm thời của nhà cung cấp LLM (429, 5xx, timeout): thử lại N lần, chờ backoff giây rồi gấp đôi
+    llm_transient_retries: int = field(default_factory=lambda: _int("LLM_TRANSIENT_RETRIES", 2))
+    llm_retry_backoff_s: float = field(default_factory=lambda: _float("LLM_RETRY_BACKOFF_S", 5.0))
+    llm_retry_max_wait_s: float = field(default_factory=lambda: _float("LLM_RETRY_MAX_WAIT_S", 30.0))
+    llm_min_interval_s: float = field(default_factory=lambda: _float("LLM_MIN_INTERVAL_S", 0.0))
     kb_version: str = field(default_factory=lambda: _env("KB_VERSION", "draft-0"))
     worker_metrics_port: int = field(default_factory=lambda: _int("WORKER_METRICS_PORT", 9104))
     retrieval_k: int = field(default_factory=lambda: _int("RETRIEVAL_K", 5))

@@ -29,24 +29,6 @@ router = APIRouter(prefix="/v1")
 STALE_S = 30
 HEAVY = {"simulator", "seed_history"}  # chỉ một job nặng chạy tại một thời điểm
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS ops_jobs (
-    id            BIGSERIAL PRIMARY KEY,
-    kind          TEXT NOT NULL,
-    params        JSONB NOT NULL DEFAULT '{}',
-    status        TEXT NOT NULL DEFAULT 'RUNNING'
-                  CHECK (status IN ('RUNNING','STOPPING','DONE','FAILED','STOPPED')),
-    progress      JSONB,
-    result        JSONB,
-    error         TEXT,
-    created_by    TEXT NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    heartbeat_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    finished_at   TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS ix_ops_jobs_kind ON ops_jobs (kind, id DESC);
-"""
-
 
 def _clean(v):
     """JSONB của PostgreSQL không nhận NaN/Infinity: đổi thành null."""
@@ -194,15 +176,49 @@ class SimParams(BaseModel):
     fault_rate: float = Field(0.02, ge=0, le=1)
     label_delay_days: float = Field(7, ge=0, le=60)
     send_labels: bool = True
+    label_backfill: bool = False  # gửi lại nhãn của mọi dòng trước offset (xem tools/simulator.py)
     seed: int = 7
 
 
+_csv_times: dict[str, tuple[int, "object"]] = {}  # file -> (mtime_ns, mảng thời gian giao dịch dạng epoch giây)
+_csv_lock = threading.Lock()
+
+
+def _csv_event_times(path):
+    """Thời gian giao dịch của mọi dòng trong CSV (đọc một lần, cache theo mtime của file)."""
+    import pandas as pd
+
+    from fraudlens.tools.simulator import epoch_s
+    mt = path.stat().st_mtime_ns
+    with _csv_lock:
+        hit = _csv_times.get(str(path))
+        if hit and hit[0] == mt:
+            return hit[1]
+        t = epoch_s(pd.read_csv(path, usecols=["trans_date_trans_time"])["trans_date_trans_time"])
+        _csv_times[str(path)] = (mt, t)
+        return t
+
+
 def _next_offset(dataset: str) -> int:
+    """Offset để "chạy tiếp": lớn hơn trong hai mốc
+    - next_offset của lần chạy simulator trên web gần nhất;
+    - số dòng của file có thời gian <= giao dịch mới nhất đã có trong DB. Mốc này tính cả các lần chạy bằng DÒNG LỆNH
+      (web không biết): nếu chỉ dựa vào lịch sử job, web sẽ gửi lại giao dịch đã xử lý -> nhận kết quả cũ (model cũ)
+      hoặc bị đánh STALE."""
     with tx() as conn:
         r = conn.execute("SELECT result->>'next_offset' AS o FROM ops_jobs WHERE kind = 'simulator' "
                          "AND params->>'dataset' = %s AND result ? 'next_offset' ORDER BY id DESC LIMIT 1",
                          (dataset,)).fetchone()
-    return int(r["o"]) if r and r["o"] else 0
+        last = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status = 'VALID'").fetchone()["t"]
+    by_job = int(r["o"]) if r and r["o"] else 0
+    by_db = 0
+    p = settings.data_dir / ("fraudTest.csv" if dataset == "test" else "fraudTrain.csv")
+    if last is not None and p.exists():
+        try:
+            by_db = int((_csv_event_times(p) <= int(last)).sum())
+        except Exception as e:  # noqa: BLE001 – file lỗi: vẫn chạy tiếp theo lịch sử job
+            log.warning("không đọc được %s để tính offset: %s", p, e)
+    return max(by_job, by_db)
 
 
 def _csv(dataset: str):
@@ -232,7 +248,8 @@ def simulator_start(p: SimParams, user: User = Depends(current_user)):
         from fraudlens.tools.simulator import replay
         opts = {"csv": str(csv), "api": settings.self_api_url, "limit": prm["limit"], "offset": prm["offset"],
                 "tps": prm["tps"], "threads": prm["threads"], "fault_rate": prm["fault_rate"],
-                "label_delay_days": prm["label_delay_days"], "no_labels": not prm["send_labels"], "seed": prm["seed"]}
+                "label_delay_days": prm["label_delay_days"], "no_labels": not prm["send_labels"],
+                "label_backfill": prm["label_backfill"], "seed": prm["seed"]}
         return replay(opts, progress=ctx.report, should_stop=ctx.should_stop)
 
     return start_job("simulator", params, user, run)
@@ -346,6 +363,9 @@ def op_test_llm(user: User = Depends(current_user)):
 
 @router.get("/ops/trace/{trans_num}")
 def op_trace(trans_num: str, user: User = Depends(current_user)):
+    # Truy vết gồm cả nhật ký audit -> cùng quyền với /v1/audit. Giá trị nhãn is_fraud KHÔNG trả về theo từng giao dịch
+    # (chỉ cho biết nhãn đã đến hay chưa): người xử lý hồ sơ không được thấy đáp án, xem fraudlens/api/views.py.
+    require_role(user, "risk_lead", "admin")
     with tx() as conn:
         t = conn.execute("SELECT id, trans_num, event_ts, card_last4, merchant, category, amt, state, status, "
                          "validation_errors, received_at FROM transactions WHERE trans_num = %s", (trans_num,)).fetchone()
@@ -355,7 +375,7 @@ def op_trace(trans_num: str, user: User = Depends(current_user)):
                "score": conn.execute("SELECT status, score, model_version, feature_set_version, error, latency_ms "
                                      "FROM scores WHERE txn_id=%s", (t["id"],)).fetchone(),
                "routing": conn.execute("SELECT * FROM routing_decisions WHERE txn_id=%s", (t["id"],)).fetchone(),
-               "label": conn.execute("SELECT is_fraud, label_ts FROM labels_eval WHERE trans_num=%s", (trans_num,)).fetchone()}
+               "label_received": conn.execute("SELECT 1 FROM labels_eval WHERE trans_num=%s", (trans_num,)).fetchone() is not None}
         c = conn.execute("SELECT * FROM cases WHERE txn_id=%s", (t["id"],)).fetchone()
         if c:
             out["case"] = c
@@ -470,6 +490,16 @@ def list_models() -> list[dict]:
         except Exception as e:  # noqa: BLE001
             gate = [f"không chạy được gate: {e}"]
         base = {k: (v.get("ranking") or {}).get("recall_at_0.01") for k, v in (m.get("baselines_val_b_report") or {}).items()}
+        test = None
+        if (d / "test_results.json").exists():  # chạy một lần bằng fraudlens.ml.final_test
+            try:
+                tr = load_json(d.name, "test_results.json")
+                test = {"comparison": tr.get("comparison"), "protocol": tr.get("protocol"),
+                        "at_t_medium": (tr.get("model") or {}).get("at_t_medium"),
+                        "routing": (tr.get("model") or {}).get("routing"),
+                        "run_at": (d / "TEST_RUN.lock").read_text().strip() if (d / "TEST_RUN.lock").exists() else None}
+            except Exception as e:  # noqa: BLE001
+                test = {"error": f"không đọc được test_results.json: {e}"}
         out.append({
             "version": d.name, "active": d.name == active, "created_at": manifest.get("created_at"),
             "feature_set_version": manifest.get("feature_set_version"), "data": manifest.get("data"),
@@ -478,7 +508,7 @@ def list_models() -> list[dict]:
             "config_version": rc.get("config_version"), "approved_by": rc.get("approved_by"),
             "approved_at": rc.get("approved_at"), "gate_violations": gate,
             "gate_override": (rc.get("release_gate") or {}).get("override"),
-            "has_test_results": (d / "test_results.json").exists(),
+            "has_test_results": (d / "test_results.json").exists(), "test": test,
         })
     return out
 

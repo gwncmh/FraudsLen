@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 from fraudlens.ml.metrics import CRITICAL_SLICES
 
+REQUIRED_BASELINES = ("rules", "lr", "tree")  # đề bài: so với luật đơn giản + ít nhất một baseline ML truyền thống
+
 
 @dataclass(frozen=True)
 class GateConfig:
@@ -29,6 +31,10 @@ def release_gate(manifest: dict, routing_config: dict, cfg: GateConfig = GateCon
     base = m.get("baselines_val_b_report") or {}
     if not base:
         reasons.append("CHƯA CHẠY BASELINE (luật, LR, cây) trên val_B")
+    else:
+        missing = [name for name in REQUIRED_BASELINES if name not in base]
+        if missing:  # model huấn luyện bằng bản code cũ (chưa có mốc này): huấn luyện lại để so đủ
+            reasons.append(f"THIẾU BASELINE {', '.join(missing)} trên val_B – chạy lại fraudlens.ml.train")
     for name, b in base.items():
         r = b["ranking"]["recall_at_0.01"]
         if not (ours >= r + cfg.baseline_margin):

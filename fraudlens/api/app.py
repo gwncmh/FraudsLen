@@ -3,7 +3,7 @@
 Chạy:  uvicorn fraudlens.api.app:app --port 8000 --workers 2
 - Nguồn giao dịch:  POST /v1/transactions, POST /v1/labels   (X-API-Key)
 - Dashboard:        /v1/cases..., /v1/stats, /v1/config         (Bearer token)
-- Tài khoản:        /v1/auth/register|login|logout|me, /v1/users (admin)
+- Tài khoản:        /v1/auth/login|logout|me|password, /v1/users (admin cấp tài khoản)
 - Vận hành web:     /v1/simulator, /v1/jobs, /v1/ops/..., /v1/system/status, /v1/models
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException
@@ -21,7 +22,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 from fraudlens.api import accounts, ops, views
-from fraudlens.api.auth import User, current_user, require_role, require_source
+from fraudlens.api.auth import User, current_user, require_role, require_source, security_warnings
 from fraudlens.api.service import FastLane
 from fraudlens.common.db import audit, tx, verify_audit_chain
 from fraudlens.common.registry import load_active_routing, root
@@ -37,6 +38,7 @@ app.include_router(accounts.users_router)
 app.include_router(ops.router)
 app.include_router(views.router)
 lane: FastLane | None = None
+SCHEMA_FILE = Path(__file__).resolve().parents[2] / "db" / "schema.sql"  # nguồn duy nhất của lược đồ
 
 
 def _registry_key() -> tuple:
@@ -80,13 +82,14 @@ def startup() -> None:
     global lane
     _rc["key"] = _registry_key()
     lane = FastLane(_load_rc())
+    for w in security_warnings():
+        log.warning("CẤU HÌNH BẢO MẬT: %s", w)
     try:
-        with tx() as conn:  # bảng tài khoản và job vận hành (DB tạo từ schema cũ cũng được bổ sung)
+        with tx() as conn:  # db/schema.sql chạy lại được nhiều lần: DB tạo từ bản cũ được bổ sung bảng/cột/ràng buộc mới
             conn.execute("SELECT pg_advisory_xact_lock(4545)")  # nhiều tiến trình uvicorn khởi động cùng lúc
-            conn.execute(accounts.SCHEMA_SQL)
-            conn.execute(ops.SCHEMA_SQL)
+            conn.execute(SCHEMA_FILE.read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
-        log.error("không tạo được bảng tài khoản/job: %s", e)
+        log.error("không áp dụng được db/schema.sql: %s", e)
     try:
         with tx() as conn:
             lane.stream_ts = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status IN ('VALID','SEED')").fetchone()["t"]
@@ -135,7 +138,7 @@ def list_cases(status: Literal["open", "closed", "all"] = "open", route: str | N
     if status == "open":
         where.append("c.status IN ('OPEN','INVESTIGATING','ESCALATED')")
     elif status == "closed":
-        where.append("c.status IN ('CLOSED_FRAUD','CLOSED_LEGIT')")
+        where.append("c.status IN ('CLOSED_FRAUD','CLOSED_LEGIT','CLOSED_INVALID')")
     if route:
         where.append("c.route = %s"); args.append(route)
     if assigned_role:
@@ -172,19 +175,23 @@ def get_case(case_id: int, user: User = Depends(current_user)):
                            (case_id,)).fetchone()
         actions = conn.execute("SELECT actor, role, action, note, created_at FROM case_actions WHERE case_id = %s ORDER BY id",
                                (case_id,)).fetchall()
+    # Giải thích của model (TreeSHAP) là kết quả ML, không phải nội dung LLM soạn: trả riêng để nhóm đối chứng vẫn thấy.
+    factors = brief["factors"] if brief else []
     holdout = is_holdout(case_id)
     if holdout:  # nhóm đối chứng: chuyên viên xử lý không có brief (brief vẫn được soạn và lưu để đánh giá sau)
         brief, job = None, None
-    return {"case": c, "brief": brief, "brief_job": job, "brief_holdout": holdout, "actions": actions}
+    return {"case": c, "brief": brief, "factors": factors, "brief_job": job, "brief_holdout": holdout, "actions": actions}
 
 
 class Action(BaseModel):
-    action: Literal["NOTE", "INVESTIGATE", "ESCALATE", "CLOSE_FRAUD", "CLOSE_LEGIT", "REGENERATE_BRIEF",
+    action: Literal["NOTE", "INVESTIGATE", "ESCALATE", "CLOSE_FRAUD", "CLOSE_LEGIT", "CLOSE_INVALID", "REGENERATE_BRIEF",
                     "VIEW", "BRIEF_USEFUL", "BRIEF_NOT_USEFUL"]
     note: str | None = None
 
 
-NEW_STATUS = {"INVESTIGATE": "INVESTIGATING", "ESCALATE": "ESCALATED", "CLOSE_FRAUD": "CLOSED_FRAUD", "CLOSE_LEGIT": "CLOSED_LEGIT"}
+# CLOSE_INVALID: payload lỗi, không có dữ liệu để kết luận gian lận hay hợp lệ – ghi đúng như vậy thay vì ép chọn một bên
+NEW_STATUS = {"INVESTIGATE": "INVESTIGATING", "ESCALATE": "ESCALATED", "CLOSE_FRAUD": "CLOSED_FRAUD",
+              "CLOSE_LEGIT": "CLOSED_LEGIT", "CLOSE_INVALID": "CLOSED_INVALID"}
 # Thao tác chỉ ghi nhận (đo thời gian xử lý, đánh giá brief), không đổi trạng thái – được phép cả khi hồ sơ đã đóng
 PASSIVE = {"VIEW", "BRIEF_USEFUL", "BRIEF_NOT_USEFUL"}
 
@@ -195,15 +202,24 @@ def act(case_id: int, a: Action, user: User = Depends(current_user)):
     note = (a.note or "").strip()
     if a.action.startswith("CLOSE") and not note:
         raise HTTPException(400, "đóng hồ sơ bắt buộc ghi nhận định")
+    if a.action == "NOTE" and not note:
+        raise HTTPException(400, "nhận định trống")
     with tx() as conn:
-        c = conn.execute("SELECT status FROM cases WHERE id = %s FOR UPDATE", (case_id,)).fetchone()
+        c = conn.execute("SELECT c.status, c.assigned_role, t.status AS txn_status FROM cases c "
+                         "JOIN transactions t ON t.id = c.txn_id WHERE c.id = %s FOR UPDATE OF c", (case_id,)).fetchone()
         if not c:
             raise HTTPException(404, "không có hồ sơ")
         if c["status"].startswith("CLOSED") and a.action not in PASSIVE:
             raise HTTPException(409, "hồ sơ đã đóng")
-        if c["status"] == "ESCALATED" and a.action.startswith("CLOSE"):
-            require_role(user, "risk_lead")
         if a.action in NEW_STATUS:
+            # Hồ sơ đã chuyển cấp thuộc về Risk Lead cho tới khi đóng: xét theo người phụ trách chứ không theo trạng thái,
+            # nếu không chuyên viên bấm "Điều tra thêm" (ESCALATED -> INVESTIGATING) là tự đóng lại được.
+            if c["assigned_role"] == "risk_lead":
+                require_role(user, "risk_lead")
+            if NEW_STATUS[a.action] == c["status"] or (a.action == "ESCALATE" and c["assigned_role"] == "risk_lead"):
+                raise HTTPException(409, "hồ sơ đã ở trạng thái này")
+            if a.action == "CLOSE_INVALID" and c["txn_status"] != "INVALID":
+                raise HTTPException(400, "chỉ đóng 'lỗi dữ liệu' cho giao dịch có payload lỗi")
             conn.execute("UPDATE cases SET status = %s, updated_at = now()"
                          + (", assigned_role = 'risk_lead'" if a.action == "ESCALATE" else "") + " WHERE id = %s",
                          (NEW_STATUS[a.action], case_id))
@@ -231,9 +247,7 @@ def stats(user: User = Depends(current_user)):
             "SELECT d.route, count(*) AS n, avg(s.latency_ms) AS avg_latency_ms FROM "
             "(SELECT txn_id, route FROM routing_decisions ORDER BY txn_id DESC LIMIT 1000) d "
             "JOIN scores s ON s.txn_id = d.txn_id GROUP BY d.route").fetchall()
-        labels = conn.execute(
-            "SELECT d.route, l.is_fraud, count(*) AS n FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
-            "JOIN routing_decisions d ON d.txn_id = t.id GROUP BY d.route, l.is_fraud").fetchall()
+        labels = conn.execute(views.LABELS_BY_ROUTE_SQL).fetchall()
     return {"open_cases": open_by_route, "routes_total": routes, "brief_jobs": jobs, "monitor": drift,
             "case_status": case_status, "briefs": briefs, "recent_routes": recent, "labels_by_route": labels}
 
@@ -264,7 +278,10 @@ def audit_verify(user: User = Depends(current_user)):
 @app.get("/v1/system/status")
 def system_status(user: User = Depends(current_user)):
     refresh_routing(force=True)
-    return ops.system_status(lane)
+    out = ops.system_status(lane)
+    if user.role == "admin":  # cấu hình yếu chỉ báo cho người sửa được nó
+        out["security_warnings"] = security_warnings()
+    return out
 
 
 @app.get("/v1/models")

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  ArrowUpRight, BadgeCheck, BrainCircuit, ChevronDown, ClipboardCheck, CreditCard, FileClock, Gauge, History, Inbox,
+  ArrowUpRight, BadgeCheck, BrainCircuit, ChevronDown, ClipboardCheck, CreditCard, FileClock, FileWarning, Gauge, History, Inbox,
   Loader2, MessageSquarePlus, RefreshCw, Search, ShieldX, ThumbsDown, ThumbsUp, TriangleAlert,
 } from "lucide-react";
 import { api } from "@/api";
@@ -28,7 +28,7 @@ const VIEWS = {
 };
 const ACTION_LABELS = {
   NOTE: "Ghi nhận định", INVESTIGATE: "Điều tra thêm", ESCALATE: "Chuyển cấp", CLOSE_FRAUD: "Đóng: gian lận",
-  CLOSE_LEGIT: "Đóng: hợp lệ", REGENERATE_BRIEF: "Soạn lại brief", BRIEF_USEFUL: "Brief hữu ích", BRIEF_NOT_USEFUL: "Brief không hữu ích",
+  CLOSE_LEGIT: "Đóng: hợp lệ", CLOSE_INVALID: "Đóng: lỗi dữ liệu", REGENERATE_BRIEF: "Soạn lại brief", BRIEF_USEFUL: "Brief hữu ích", BRIEF_NOT_USEFUL: "Brief không hữu ích",
 };
 
 // ------------------------------------------------------------------ hàng đợi
@@ -83,6 +83,37 @@ function Section({ icon: Icon, title, badge, defaultOpen = true, children }) {
   );
 }
 
+/** Lý do LLM không phản hồi, viết cho chuyên viên đọc (mã lỗi gốc vẫn hiện ở dòng dưới). */
+function llmProblem(msg) {
+  const code = Number((msg.match(/'(\d{3}) /) || [])[1]);
+  if (/chưa cấu hình LLM_API_KEY/.test(msg)) return "Chưa cấu hình LLM_API_KEY.";
+  if (code === 503 || code === 502 || code === 500 || code === 504) return `Máy chủ LLM đang quá tải hoặc tạm ngừng (lỗi ${code} phía nhà cung cấp).`;
+  if (code === 429) return "Đã hết hạn mức gọi LLM trong lúc này (lỗi 429).";
+  if (code === 401 || code === 403) return `LLM từ chối API key (lỗi ${code}): kiểm tra LLM_API_KEY.`;
+  if (code === 404) return "Không tìm thấy model (lỗi 404): kiểm tra LLM_MODEL.";
+  if (/Timeout/i.test(msg)) return "LLM trả lời quá thời gian chờ.";
+  if (/Connect/i.test(msg)) return "Không kết nối được tới LLM: kiểm tra LLM_BASE_URL và mạng.";
+  return "LLM không phản hồi.";
+}
+
+/** Brief mẫu được dùng vì: LLM không phản hồi, và/hoặc brief LLM viết ra không qua bộ kiểm tra (guardrail). */
+function BriefIssues({ rejections }) {
+  const flat = rejections.flatMap((r) => (Array.isArray(r) ? r : [r])).map(String);
+  const down = flat.filter((x) => x.startsWith("LLM_UNAVAILABLE"));
+  const rejected = flat.filter((x) => !x.startsWith("LLM_UNAVAILABLE"));
+  return (<>
+    {down.length > 0 && (
+      <Alert variant="warn" icon={TriangleAlert} title="LLM không phản hồi – đang dùng brief mẫu">
+        <p>{llmProblem(down[down.length - 1])} Điểm và phân luồng không bị ảnh hưởng. Bấm <b>Soạn lại brief</b> để thử lại.</p>
+        <p className="mt-1 break-all font-mono text-[11px] opacity-70">{down[down.length - 1].replace(/^LLM_UNAVAILABLE:\s*/, "").split("\n")[0]}</p>
+      </Alert>
+    )}
+    {rejected.length > 0 && (
+      <Alert variant="warn" icon={TriangleAlert} title="Brief LLM bị bộ kiểm tra loại">{rejected.join("; ")}</Alert>
+    )}
+  </>);
+}
+
 function Brief({ d, onFeedback }) {
   if (d.brief_holdout) return <p className="text-sm text-muted-foreground">Hồ sơ thuộc nhóm đối chứng: brief không hiển thị (dùng để đo giá trị của brief).</p>;
   const brief = d.brief;
@@ -95,9 +126,7 @@ function Brief({ d, onFeedback }) {
         {brief.brief_source === "llm" ? <Badge variant="info"><BrainCircuit />LLM · {brief.llm_model}</Badge> : <Badge variant="secondary">Brief dạng mẫu</Badge>}
         <span>playbook {brief.kb_version}</span><span>· đoạn: {(brief.chunk_ids || []).join(", ") || "–"}</span>
       </div>
-      {brief.brief_source === "fallback" && rej.length > 0 && (
-        <Alert variant="warn" icon={TriangleAlert} title="Brief LLM bị bộ kiểm tra loại">{rej.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("; ")}</Alert>
-      )}
+      {brief.brief_source === "fallback" && <BriefIssues rejections={rej} />}
       <div><p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tóm tắt</p>
         <ul className="list-disc space-y-1 pl-5">{b.summary.map((s, i) => <li key={i}>{s.text}</li>)}</ul></div>
       <div><p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tín hiệu rủi ro</p>
@@ -148,7 +177,8 @@ function CaseDetail({ id, user, onChanged, onNext }) {
   const f = c.features || {};
   const sev = severityOf(c.route, c.score);
   const closed = c.status.startsWith("CLOSED");
-  const escalatedLock = c.status === "ESCALATED" && user.role !== "risk_lead";
+  // hồ sơ đã chuyển cấp thuộc về Risk Lead cho tới khi đóng (API cũng chặn): chuyên viên chỉ còn ghi nhận định
+  const leadOnly = c.assigned_role === "risk_lead" && user.role !== "risk_lead";
   const history = d.actions.filter((a) => a.action !== "VIEW");
 
   return (
@@ -183,7 +213,7 @@ function CaseDetail({ id, user, onChanged, onNext }) {
                 ["Model / config", <span key="m" className="font-mono text-xs">{c.model_version || "–"} · {c.config_version || "–"}</span>],
                 c.validation_errors?.length ? ["Lỗi dữ liệu", <span key="v" className="flex flex-wrap gap-1">{c.validation_errors.map((e) => <Badge key={e} variant="UNSCORED">{e}</Badge>)}</span>] : null,
               ]} />
-              <FactorList factors={d.brief?.factors} />
+              <FactorList factors={d.factors ?? d.brief?.factors} />
             </div>
           </Section>
           <Section icon={CreditCard} title="Hành vi thẻ (feature)" defaultOpen={false}>
@@ -205,20 +235,25 @@ function CaseDetail({ id, user, onChanged, onNext }) {
               <div className="space-y-3">
                 <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Nhận định của chuyên viên (bắt buộc khi đóng hồ sơ)…" rows={4} />
                 <div className="grid grid-cols-2 gap-2">
-                  <Button variant="destructive" disabled={!note.trim() || escalatedLock || !!busy} onClick={() => act("CLOSE_FRAUD", true)}>
+                  <Button variant="destructive" disabled={!note.trim() || leadOnly || !!busy} onClick={() => act("CLOSE_FRAUD", true)}>
                     {busy === "CLOSE_FRAUD" ? <Loader2 className="animate-spin" /> : <ShieldX />}Gian lận
                   </Button>
-                  <Button variant="success" disabled={!note.trim() || escalatedLock || !!busy} onClick={() => act("CLOSE_LEGIT", true)}>
+                  <Button variant="success" disabled={!note.trim() || leadOnly || !!busy} onClick={() => act("CLOSE_LEGIT", true)}>
                     {busy === "CLOSE_LEGIT" ? <Loader2 className="animate-spin" /> : <BadgeCheck />}Hợp lệ
                   </Button>
                 </div>
+                {c.txn_status === "INVALID" && (
+                  <Button variant="secondary" className="w-full" disabled={!note.trim() || leadOnly || !!busy} onClick={() => act("CLOSE_INVALID", true)}>
+                    {busy === "CLOSE_INVALID" ? <Loader2 className="animate-spin" /> : <FileWarning />}Lỗi dữ liệu – không kết luận được
+                  </Button>
+                )}
                 <div className="grid grid-cols-2 gap-2">
-                  <Button variant="outline" size="sm" disabled={!!busy || c.status === "INVESTIGATING"} onClick={() => act("INVESTIGATE")}><Search />Điều tra thêm</Button>
-                  <Button variant="outline" size="sm" disabled={!!busy || c.status === "ESCALATED"} onClick={() => act("ESCALATE")}><ArrowUpRight />Chuyển cấp</Button>
+                  <Button variant="outline" size="sm" disabled={!!busy || leadOnly || c.status === "INVESTIGATING"} onClick={() => act("INVESTIGATE")}><Search />Điều tra thêm</Button>
+                  <Button variant="outline" size="sm" disabled={!!busy || c.assigned_role === "risk_lead"} onClick={() => act("ESCALATE")}><ArrowUpRight />Chuyển cấp</Button>
                   <Button variant="outline" size="sm" disabled={!note.trim() || !!busy} onClick={() => act("NOTE")}><MessageSquarePlus />Ghi nhận định</Button>
                   <Button variant="outline" size="sm" disabled={!!busy} onClick={() => act("REGENERATE_BRIEF")}><RefreshCw />Soạn lại brief</Button>
                 </div>
-                {escalatedLock && <p className="text-xs text-muted-foreground">Hồ sơ đã chuyển cấp: chỉ Risk Lead được đóng.</p>}
+                {leadOnly && <p className="text-xs text-muted-foreground">Hồ sơ đã chuyển cấp: chỉ Risk Lead được đổi trạng thái hoặc đóng.</p>}
                 <p className="text-[11px] text-muted-foreground">Đóng hồ sơ sẽ tự chuyển sang hồ sơ tiếp theo trong hàng đợi.</p>
               </div>
             )}

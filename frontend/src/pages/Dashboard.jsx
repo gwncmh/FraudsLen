@@ -163,7 +163,7 @@ function FlaggedItem({ f, open, onToggle }) {
                   <div className="flex flex-wrap gap-1">{f.validation_errors.map((e) => <Badge key={e} variant="UNSCORED">{e}</Badge>)}</div>
                 ) : f.score_error ? <Badge variant="UNSCORED">{f.score_status}: {f.score_error}</Badge> : null}
                 {signals.length ? <ul className="list-disc space-y-1 pl-4 text-xs">{signals.slice(0, 4).map((s, i) => <li key={i}>{s}</li>)}</ul>
-                  : !f.validation_errors?.length && <p className="text-xs text-muted-foreground">{f.brief_source ? "Brief không nêu tín hiệu." : "Brief đang được soạn…"}</p>}
+                  : !f.validation_errors?.length && <p className="text-xs text-muted-foreground">{f.brief_holdout ? "Nhóm đối chứng: brief không hiển thị." : f.brief_source ? "Brief không nêu tín hiệu." : "Brief đang được soạn…"}</p>}
               </div>
               <div className="space-y-2">
                 <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Yếu tố ảnh hưởng</p>

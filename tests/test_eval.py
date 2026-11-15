@@ -1,6 +1,7 @@
 """Kiểm thử phần đánh giá: số đo benchmark, slice + bootstrap, release gate, behavioral test, validation ngữ nghĩa,
 guardrail siết chặt, bộ đánh giá LLM, truy xuất playbook, so khớp offline/online, giám sát.   Chạy: pytest -q
 """
+import csv
 import json
 import math
 
@@ -120,7 +121,7 @@ def _rep(recall, slices_recall=0.9, wl=1.0):
 
 def _manifest(**kw):
     beh = {"passed": True, "invariance": {"passed": True}, "mft": {"passed": True}, "directional_passed": True}
-    m = {"metrics": {"val_b_report": _rep(0.9), "baselines_val_b_report": {"lr": _rep(0.7), "rules": _rep(0.4)}},
+    m = {"metrics": {"val_b_report": _rep(0.9), "baselines_val_b_report": {"lr": _rep(0.7), "rules": _rep(0.4), "tree": _rep(0.8)}},
          "behavior": beh}
     m["metrics"].update(kw.pop("metrics", {}))
     m.update(kw)
@@ -134,6 +135,7 @@ def test_gate_passes_good_model():
 @pytest.mark.parametrize("manifest,rc,needle", [
     (_manifest(metrics={"val_b_report": _rep(0.6)}), {}, "không vượt baseline lr"),
     (_manifest(metrics={"baselines_val_b_report": {}}), {}, "CHƯA CHẠY BASELINE"),
+    (_manifest(metrics={"baselines_val_b_report": {"lr": _rep(0.7), "rules": _rep(0.4)}}), {}, "THIẾU BASELINE tree"),
     (_manifest(), {"val_b_check": {"workload_ratio": 1.5}}, "workload_ratio"),
     (_manifest(metrics={"val_b_report": _rep(0.9, slices_recall=0.3)}), {}, "slice"),
     (_manifest(behavior={"passed": False, "invariance": {"passed": True}, "mft": {"passed": False},
@@ -329,3 +331,211 @@ def test_route_ratio_levels():
     assert ratio_level(0.01, 0.01)[1] == "OK"
     assert ratio_level(0.016, 0.01)[1] == "WARN"
     assert ratio_level(0.004, 0.01)[1] == "ALERT"
+
+
+# ---------------------------------------------------------------- đánh giá LLM: đầu ra thô và người chấm
+def test_guardrail_stats_measures_raw_llm_output():
+    from fraudlens.worker.evaluate import guardrail_stats
+    rows = [
+        {"source": "llm", "guardrail": {"attempts": 1, "rejections": []}},                                   # qua ngay
+        {"source": "llm", "guardrail": {"attempts": 2, "rejections": [["NUMBER_NOT_IN_DATA:42"]]}},          # qua sau khi sinh lại
+        {"source": "fallback", "guardrail": {"attempts": 2, "rejections": [["FORBIDDEN:lenh_khoa_the"], ["JSON_INVALID"]]}},
+        {"source": "fallback", "guardrail": {"attempts": 1, "rejections": [["LLM_UNAVAILABLE: timeout"]]}},  # LLM không trả lời
+        {"source": "fallback", "guardrail": {"attempts": 0, "rejections": []}},                              # không gọi LLM
+        {"source": "fallback", "guardrail": None},
+    ]
+    st = guardrail_stats(rows)
+    assert st["briefs_llm_answered"] == 3 and st["llm_unavailable"] == 1
+    assert (st["accepted_first_try"], st["accepted_after_retry"], st["rejected_to_fallback"]) == (1, 1, 1)
+    assert st["first_try_pass_rate"] == pytest.approx(1 / 3) and st["final_pass_rate"] == pytest.approx(2 / 3)
+    assert st["rejection_reasons"] == {"NUMBER_NOT_IN_DATA": 1, "FORBIDDEN": 1, "JSON_INVALID": 1}
+    assert guardrail_stats([])["first_try_pass_rate"] is None
+
+
+def test_human_agreement_from_graded_export(tmp_path):
+    from fraudlens.worker.evaluate import human_agreement
+    p = tmp_path / "graded.csv"
+    lines = ["brief_id,case_id,source,kind,text,evidence,auto_grounded,auto_errors,human_grounded"]
+    # 6 dòng rubric và người cùng cho đạt, 2 dòng rubric cho đạt nhưng người chấm không, 1 dòng cùng không đạt,
+    # 1 dòng rubric loại nhưng người cho đạt, 2 dòng chưa chấm
+    lines += ["1,1,llm,summary,a,amt,1,,1"] * 6 + ["2,2,llm,summary,b,amt,1,,0"] * 2
+    lines += ["3,3,fallback,risk_signal,c,amt,0,X,0", "4,4,fallback,risk_signal,d,amt,0,X,1", "5,5,llm,summary,e,amt,1,,", "6,6,llm,summary,f,amt,1,,?"]
+    p.write_text("\n".join(lines), encoding="utf-8-sig")
+    rep = human_agreement(str(p))
+    assert rep["graded"] == 10 and rep["ungraded"] == 2
+    assert rep["human_grounded_rate"] == pytest.approx(0.7) and rep["meets_target"] is False
+    assert rep["auto_grounded_rate"] == pytest.approx(0.8) and rep["agreement"] == pytest.approx(0.7)
+    assert rep["confusion"] == {"auto_ok_human_ok": 6, "auto_ok_human_bad": 2, "auto_bad_human_ok": 1, "auto_bad_human_bad": 1}
+    assert -1 <= rep["cohen_kappa"] < 0.5
+    assert rep["by_source"]["llm"] == {"graded": 8, "human_grounded_rate": 0.75}
+    p.write_text(lines[0] + "\n1,1,llm,summary,a,amt,1,,", encoding="utf-8-sig")
+    assert human_agreement(str(p))["graded"] == 0
+
+
+def test_export_has_data_for_graders_and_roundtrips(tmp_path):
+    """File chấm tay chứa sẵn dữ liệu của brief; người chấm điền human_grounded rồi --import đọc lại được."""
+    import csv
+    from fraudlens.worker.evaluate import EXPORT_COLUMNS, evaluate_briefs, export_csv, human_agreement
+    data = {"case_id": 1, "route": "HIGH", "score": 0.93, "score_status": "SCORED",
+            "fields": {"amt": 950.5, "n_txn_24h": 7, "category": "shopping_net"},
+            "top_factors": [{"feature": "amt", "direction": "tăng rủi ro"}], "errors": None}
+    brief = {"summary": [{"text": "Giao dịch 950.5 ở shopping_net.", "evidence": ["amt", "category"]}],
+             "risk_signals": [{"signal": "Có 7 giao dịch trong 24 giờ.", "evidence": ["khong_co_truong_nay"]}]}
+    rep = evaluate_briefs([{"brief_id": 5, "case_id": 1, "source": "llm", "brief": brief, "data": data}])
+    p = tmp_path / "e.csv"
+    export_csv(str(p), rep["claims"], {5: data})
+    rows = list(csv.DictReader(open(p, encoding="utf-8-sig", newline="")))
+    assert list(rows[0]) == EXPORT_COLUMNS and len(rows) == 2
+    assert "amt = 950.5" in rows[0]["data"] and "route = HIGH" in rows[0]["data"] and "amt (tăng rủi ro)" in rows[0]["data"]
+    assert [r["auto_grounded"] for r in rows] == ["1", "0"]
+    rows[0]["human_grounded"], rows[1]["human_grounded"] = "1", "0"
+    with open(p, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, EXPORT_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    agr = human_agreement(str(p))
+    assert agr["graded"] == 2 and agr["agreement"] == 1.0 and agr["human_grounded_rate"] == 0.5
+
+
+@pytest.mark.parametrize("delim", [",", ";", "\t"])
+def test_human_agreement_reads_excel_delimiters(tmp_path, delim):
+    """Excel định dạng vùng Việt Nam lưu CSV bằng ';' – vẫn phải đọc được điểm của người chấm."""
+    from fraudlens.worker.evaluate import human_agreement
+    p = tmp_path / "g.csv"
+    head = ["brief_id", "source", "text", "data", "human_grounded", "note", "auto_grounded"]
+    rows = [["1", "llm", "Giao dịch 9,5 USD", "amt = 9.5\nroute = HIGH", "1", "", "1"],
+            ["2", "llm", "Có 100 giao dịch; rất nhiều", "n_txn_24h = 2", "0", "sai số", "1"]]
+    with open(p, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=delim)
+        w.writerow(head)
+        w.writerows(rows)
+    rep = human_agreement(str(p))
+    assert rep["graded"] == 2 and rep["human_grounded_rate"] == 0.5 and rep["confusion"]["auto_ok_human_bad"] == 1
+
+
+# ---------------------------------------------------------------- LLM: thử lại khi nhà cung cấp lỗi tạm thời
+def _llm_client(monkeypatch, responses):
+    """LLMClient gọi máy chủ giả: responses là danh sách mã HTTP (hoặc ngoại lệ) trả về lần lượt."""
+    import httpx
+    from fraudlens.worker import llm
+    calls, sleeps = [], []
+
+    def handler(request):
+        calls.append(1)
+        r = responses[len(calls) - 1]
+        if isinstance(r, Exception):
+            raise r
+        if r == 200:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "{\"ok\": true}"}}], "usage": {"total_tokens": 7}})
+        return httpx.Response(r, headers={"retry-after": "3"} if r == 429 else {})
+
+    monkeypatch.setattr(llm, "settings", SimpleNamespaceSettings())
+    c = llm.LLMClient(sleep=sleeps.append)
+    c.http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://llm")
+    c.base = "http://llm"
+    return c, calls, sleeps
+
+
+class SimpleNamespaceSettings:
+    llm_api_key, llm_base_url, llm_model, llm_timeout_s = "k", "http://llm", "m", 1.0
+    llm_min_interval_s, llm_transient_retries, llm_retry_backoff_s, llm_retry_max_wait_s = 0.0, 2, 5.0, 30.0
+
+
+def test_llm_retries_transient_errors_then_succeeds(monkeypatch):
+    c, calls, sleeps = _llm_client(monkeypatch, [503, 429, 200])
+    assert c.chat_json("s", "u") == ('{"ok": true}', 7)
+    assert len(calls) == 3 and sleeps == [5.0, 3.0]  # backoff 5 s, rồi theo Retry-After của 429
+
+
+def test_llm_gives_up_after_retries_with_clear_message(monkeypatch):
+    from fraudlens.worker.llm import LLMUnavailable
+    c, calls, sleeps = _llm_client(monkeypatch, [503, 503, 503])
+    with pytest.raises(LLMUnavailable, match=r"503.*đã thử 3 lần"):
+        c.chat_json("s", "u")
+    assert len(calls) == 3 and sleeps == [5.0, 10.0]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+def test_llm_permanent_errors_fail_fast(monkeypatch, code):
+    from fraudlens.worker.llm import LLMUnavailable
+    c, calls, sleeps = _llm_client(monkeypatch, [code, 200])
+    with pytest.raises(LLMUnavailable, match=str(code)):
+        c.chat_json("s", "u")
+    assert len(calls) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize("base, thinking_flag", [
+    ("https://dashscope-intl.aliyuncs.com/compatible-mode/v1", True),   # Qwen trên Alibaba Cloud: phải tắt thinking
+    ("https://dashscope.aliyuncs.com/compatible-mode/v1", True),
+    ("https://api.groq.com/openai/v1", False),                          # nhà cung cấp khác: không gửi tham số lạ
+])
+def test_llm_disables_qwen_thinking_only_on_dashscope(monkeypatch, base, thinking_flag):
+    import json as _json
+
+    import httpx
+    from fraudlens.worker import llm
+    sent = []
+
+    def handler(request):
+        sent.append(_json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    monkeypatch.setattr(llm, "settings", type("S", (SimpleNamespaceSettings,), {"llm_base_url": base})())
+    c = llm.LLMClient(sleep=lambda s: None)
+    c.http = httpx.Client(transport=httpx.MockTransport(handler))
+    c.chat_json("Trả về JSON.", "u")
+    assert ("enable_thinking" in sent[0]) is thinking_flag
+    assert sent[0].get("enable_thinking", False) is False and sent[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize("raw, clean", [
+    ('<think>\nxét amt...\n</think>\n{"summary": []}', '{"summary": []}'),   # Qwen3 local (Ollama/vLLM)
+    ('{"summary": []}', '{"summary": []}'),
+    ('{"text": "<think> nằm giữa không bị cắt"}', '{"text": "<think> nằm giữa không bị cắt"}'),
+])
+def test_strip_think_block(raw, clean):
+    from fraudlens.worker.llm import strip_think
+    assert strip_think(raw) == clean
+
+
+def test_default_llm_is_free_local_qwen(monkeypatch):
+    from fraudlens.common.config import Settings
+    for k in ("LLM_BASE_URL", "LLM_MODEL"):
+        monkeypatch.delenv(k, raising=False)  # bỏ giá trị .env nạp sẵn, xem mặc định trong code
+    s = Settings()
+    assert s.llm_base_url == "http://host.docker.internal:11434/v1" and s.llm_model == "qwen2.5:7b"
+
+
+def test_ollama_url_works_inside_and_outside_docker():
+    from fraudlens.worker.llm import local_base
+    url = "http://host.docker.internal:11434/v1"
+    assert local_base(url, in_container=True) == url
+    assert local_base(url, in_container=False) == "http://localhost:11434/v1"
+    assert local_base("https://api.groq.com/openai/v1", in_container=False) == "https://api.groq.com/openai/v1"
+
+
+def test_llm_retries_timeouts(monkeypatch):
+    import httpx
+    c, calls, sleeps = _llm_client(monkeypatch, [httpx.ReadTimeout("chậm"), 200])
+    assert c.chat_json("s", "u")[1] == 7 and len(calls) == 2
+
+
+def test_retry_feedback_explains_errors_in_plain_words():
+    """Lần sinh lại nhận lời giải thích cụ thể (cụm từ nào sai, sửa thế nào) thay vì mã lỗi trần."""
+    from fraudlens.worker.guardrail import explain_errors
+    msg = explain_errors(["CLAIM_CONTRADICTS_DATA:NEW_CATEGORY", "CLAIM_CONTRADICTS_DATA:NEW_CATEGORY",
+                          "NUMBER_NOT_IN_DATA:999", "FORBIDDEN:lenh_hoan_tien", "SCHEMA:summary[0]", "LẠ:x"])
+    lines = msg.splitlines()
+    assert len(lines) == 5                                                   # bỏ lỗi trùng
+    assert "is_new_category_30d = 0" in lines[0] and "'merchant mới'" in lines[0]
+    assert "999" in lines[1] and "hoàn tiền" in lines[2] and "summary[0]" in lines[3] and lines[4] == "- LẠ:x"
+
+
+def test_prompt_lists_precomputed_signals():
+    from fraudlens.worker.brief import build_data
+    case = {"id": 1, "route": "HIGH", "score_status": "SCORED", "score": 0.9, "amt": 900.0, "category": "shopping_net",
+            "merchant": "m", "card_last4": "1234", "features": {"amt_ratio_30d": 9.0, "is_new_category_30d": 0,
+                                                                "is_new_merchant_30d": 1, "is_night": 0, "n_txn_30d": 20}}
+    sig = [s["signal"] for s in build_data(case, None)["signals"]]
+    assert any("Merchant mới" in s for s in sig) and not any("Loại merchant mới" in s for s in sig)
+    assert any("gấp 9.0 lần" in s for s in sig)

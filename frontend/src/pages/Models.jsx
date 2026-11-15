@@ -24,6 +24,42 @@ function Metric({ label, value, sub }) {
   );
 }
 
+const BASELINE_NAMES = { model: "XGBoost (model này)", rules: "Luật viết tay", lr: "Logistic Regression", tree: "Decision Tree" };
+
+/** Kết quả trên test set (fraudTest.csv) – chỉ có sau khi chạy `python -m fraudlens.ml.final_test` MỘT lần cho model đã duyệt. */
+function TestResults({ m }) {
+  const t = m.test;
+  if (!t) {
+    return m.active && m.approved_by ? (  // chỉ nhắc ở model đang dùng: test set dành cho model đã chốt
+      <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+        Chưa chạy test set. Số đo ở trên là val_B (dùng để chọn và duyệt model). Khi đã chốt model, chạy <b>một lần</b>:{" "}
+        <code className="break-all">docker compose --profile tools run --rm --entrypoint python trainer -m fraudlens.ml.final_test --data-dir /app/data --version {m.version}</code>
+      </p>
+    ) : null;
+  }
+  if (t.error) return <Alert variant="error" title="Kết quả test set">{t.error}</Alert>;
+  const rows = Object.entries(t.comparison || {});
+  const cm = t.at_t_medium;
+  return (
+    <div className="space-y-2 rounded-lg border p-3">
+      <p className="text-sm font-semibold">Test set <span className="text-xs font-normal text-muted-foreground">
+        · {num(t.protocol?.test_rows)} GD, {num(t.protocol?.test_frauds)} gian lận · ngưỡng {t.protocol?.thresholds_from}{t.run_at ? ` · chạy ${fmtDate(t.run_at)}` : ""}</span></p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs tabular">
+          <thead><tr className="text-left text-muted-foreground"><th className="py-1 pr-3 font-medium">Mô hình</th><th className="pr-3 font-medium">Recall@1%</th><th className="pr-3 font-medium">Precision@1%</th><th className="pr-3 font-medium">FP@1%</th><th className="pr-3 font-medium">Bỏ sót@1%</th><th className="pr-3 font-medium">PR-AUC</th><th className="font-medium">F1 @t_medium</th></tr></thead>
+          <tbody>{rows.map(([k, r]) => (
+            <tr key={k} className={cn("border-t", k === "model" && "font-semibold")}>
+              <td className="py-1 pr-3">{BASELINE_NAMES[k] || k}</td><td className="pr-3">{pct(r["recall@1%"], 2)}</td><td className="pr-3">{pct(r["precision@1%"], 1)}</td>
+              <td className="pr-3">{num(r["fp@1%"])}</td><td className="pr-3">{num(r["missed@1%"])}</td><td className="pr-3">{num(r.pr_auc, 3)}</td><td>{num(r["f1@t_medium"], 3)}</td>
+            </tr>))}</tbody>
+        </table>
+      </div>
+      {cm && <p className="text-xs text-muted-foreground">Confusion matrix tại t_medium: TP {num(cm.tp)} · FP {num(cm.fp)} · FN {num(cm.fn)} · TN {num(cm.tn)} · precision {pct(cm.precision, 1)} · recall {pct(cm.recall, 1)}
+        {t.routing ? ` · workload ${num(t.routing.workload_ratio, 2)}× năng lực review` : ""}</p>}
+    </div>
+  );
+}
+
 function ModelCard({ m, user, onApproved, i }) {
   const [override, setOverride] = useState("");
   const [busy, setBusy] = useState(false);
@@ -55,6 +91,7 @@ function ModelCard({ m, user, onApproved, i }) {
             <Metric label="Workload · recall M+H" value={`${num(chk.workload_ratio, 2)} · ${pct(chk.recall_medium_high, 1)}`} sub={`precision HIGH ${pct(chk.precision_high, 1)}`} />
           </div>
           {!gateOk && <Alert variant="error" icon={ShieldAlert} title="Release gate chặn"><ul className="list-disc pl-4">{m.gate_violations.map((v, k) => <li key={k}>{v}</li>)}</ul></Alert>}
+          <TestResults m={m} />
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-muted-foreground">
               {m.approved_by ? <>Duyệt bởi <b className="text-foreground">{m.approved_by}</b> lúc {fmtDate(m.approved_at)}{m.gate_override ? ` (override: ${m.gate_override})` : ""}</> : "Chưa duyệt"}

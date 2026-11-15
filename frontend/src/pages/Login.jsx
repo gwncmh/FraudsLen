@@ -1,11 +1,10 @@
 import React, { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Activity, BrainCircuit, KeyRound, Loader2, ShieldCheck, ShieldHalf, Workflow } from "lucide-react";
+import { Activity, BrainCircuit, Loader2, ShieldCheck, ShieldHalf, Workflow } from "lucide-react";
 import { api, setToken } from "@/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Alert } from "@/components/ui/misc";
 
 const FEATURES = [
@@ -16,39 +15,27 @@ const FEATURES = [
 ];
 
 export default function Login({ onDone }) {
-  const [mode, setMode] = useState("login");
   const [cfg, setCfg] = useState(null);
-  const [f, setF] = useState({ username: "", display_name: "", password: "", confirm: "", token: "" });
+  const [f, setF] = useState({ username: "", password: "" });
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    api.authConfig().then((c) => { setCfg(c); if (c.db_ready && !c.has_users) setMode("register"); }).catch(() => setCfg({ db_ready: false }));
-  }, []);
+  useEffect(() => { api.authConfig().then(setCfg).catch(() => setCfg({ db_ready: false })); }, []);
 
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const submit = async (e) => {
     e.preventDefault();
     setErr("");
-    if (mode === "register" && f.password !== f.confirm) return setErr("Mật khẩu nhập lại không khớp");
     setBusy(true);
     try {
-      if (mode === "token") {
-        setToken(f.token.trim());
-        await api.me();
-      } else {
-        const r = mode === "login"
-          ? await api.login(f.username, f.password)
-          : await api.register({ username: f.username, display_name: f.display_name, password: f.password });
-        setToken(r.token);
-      }
+      const r = await api.login(f.username, f.password);
+      setToken(r.token);
       onDone();
     } catch (ex) {
       setToken("");
-      setErr(ex.message === "UNAUTHORIZED" ? "Token không hợp lệ" : ex.message);
+      setErr(ex.message === "UNAUTHORIZED" ? "Sai tên đăng nhập hoặc mật khẩu" : ex.message);
     } finally { setBusy(false); }
   };
-  const firstUser = cfg?.db_ready && !cfg.has_users;
 
   return (
     <div className="grid min-h-full lg:grid-cols-2">
@@ -79,37 +66,25 @@ export default function Login({ onDone }) {
         <motion.div initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} className="w-full max-w-sm">
           <Card className="shadow-lg">
             <CardHeader className="space-y-2 pb-4">
-              <CardTitle className="text-xl">{mode === "register" ? "Tạo tài khoản" : "Đăng nhập"}</CardTitle>
-              <CardDescription>{mode === "register" ? "Tài khoản mới có vai trò Fraud Analyst." : "Chào mừng quay lại FraudLens."}</CardDescription>
+              <CardTitle className="text-xl">Đăng nhập</CardTitle>
+              <CardDescription>Tài khoản nội bộ do Admin cấp. Quên mật khẩu hoặc cần tài khoản mới, liên hệ Admin.</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={submit} className="grid gap-4">
-                {mode !== "token" && (
-                  <Tabs value={mode} onValueChange={setMode}>
-                    <TabsList className="grid w-full grid-cols-2">
-                      <TabsTrigger value="login">Đăng nhập</TabsTrigger>
-                      <TabsTrigger value="register" disabled={cfg && !cfg.allow_registration}>Đăng ký</TabsTrigger>
-                    </TabsList>
-                  </Tabs>
-                )}
                 {cfg && !cfg.db_ready && <Alert variant="error" title="Chưa kết nối được cơ sở dữ liệu">Kiểm tra container postgres / api.</Alert>}
-                {firstUser && mode === "register" && <Alert title="Tài khoản đầu tiên">Tài khoản này sẽ có quyền <b>Admin</b>.</Alert>}
-                {mode === "token" ? (
-                  <Field label="Token tĩnh (DASHBOARD_TOKENS trong .env)"><Input value={f.token} onChange={set("token")} placeholder="analyst-token" autoFocus /></Field>
-                ) : (<>
-                  <Field label="Tên đăng nhập"><Input value={f.username} onChange={set("username")} autoComplete="username" placeholder="vd: hung.nguyen" autoFocus required /></Field>
-                  {mode === "register" && <Field label="Họ tên hiển thị"><Input value={f.display_name} onChange={set("display_name")} placeholder="Nguyễn Văn A" /></Field>}
-                  <Field label="Mật khẩu" hint={mode === "register" ? "Ít nhất 8 ký tự, có cả chữ và số." : null}>
-                    <Input type="password" value={f.password} onChange={set("password")} required autoComplete={mode === "login" ? "current-password" : "new-password"} />
-                  </Field>
-                  {mode === "register" && <Field label="Nhập lại mật khẩu"><Input type="password" value={f.confirm} onChange={set("confirm")} required autoComplete="new-password" /></Field>}
-                </>)}
+                {cfg?.db_ready && !cfg.has_users && (
+                  <Alert title="Hệ thống chưa có tài khoản">
+                    Tạo tài khoản Admin đầu tiên bằng lệnh:<br />
+                    <code className="text-xs">docker compose exec api python -m fraudlens.tools.admin create-user admin admin</code>
+                  </Alert>
+                )}
+                <Field label="Tên đăng nhập"><Input value={f.username} onChange={set("username")} autoComplete="username" placeholder="vd: hung.nguyen" autoFocus required /></Field>
+                <Field label="Mật khẩu">
+                  <Input type="password" value={f.password} onChange={set("password")} required autoComplete="current-password" />
+                </Field>
                 {err && <p className="text-sm text-destructive">{err}</p>}
                 <Button type="submit" disabled={busy} className="w-full">
-                  {busy && <Loader2 className="animate-spin" />}{mode === "register" ? "Tạo tài khoản" : "Đăng nhập"}
-                </Button>
-                <Button type="button" variant="link" size="sm" onClick={() => setMode(mode === "token" ? "login" : "token")}>
-                  <KeyRound />{mode === "token" ? "Đăng nhập bằng tài khoản" : "Đăng nhập bằng token tĩnh"}
+                  {busy && <Loader2 className="animate-spin" />}Đăng nhập
                 </Button>
               </form>
             </CardContent>

@@ -225,6 +225,13 @@ def section_db(md: list[str]) -> None:
     if ev.get("by_source"):
         md += [_table(["Nguồn", "Brief", "Nhận định", "Có căn cứ"],
                       [[k, v["briefs"], v["claims"], _f(v["grounded_rate"])] for k, v in ev["by_source"].items()]), ""]
+    raw = ev.get("llm_raw") or {}
+    if raw.get("briefs_llm_answered"):
+        md += [f"Đầu ra thô của LLM (trước khi guardrail lọc), {raw['briefs_llm_answered']} brief: qua kiểm tra ngay lần đầu "
+               f"{_f(raw['first_try_pass_rate'])}, sau khi sinh lại {_f(raw['final_pass_rate'])}, "
+               f"{raw['rejected_to_fallback']} brief phải dùng mẫu. Lý do bị loại: {raw['rejection_reasons'] or 'không có'}.", ""]
+    md += ["> Tỉ lệ ở bảng trên chấm brief đã qua guardrail bằng chính rubric của guardrail, nên không thay được người chấm. "
+           "Xuất mẫu bằng `admin eval-briefs --export`, điền cột `human_grounded`, rồi `admin eval-briefs --import`.", ""]
     md += ["## Giá trị sản phẩm", ""]
     rows = [[k, *[_f(v.get(x)) if isinstance(v, dict) else "–" for x in ("n", "median_s", "mean_s")]]
             for k, v in pm["handling_time_by_arm"].items()]

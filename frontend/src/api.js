@@ -45,7 +45,6 @@ export const api = {
   // tài khoản
   authConfig: () => call("/v1/auth/config"),
   login: (username, password) => post("/v1/auth/login", { username, password }),
-  register: (data) => post("/v1/auth/register", data),
   logout: () => post("/v1/auth/logout"),
   me: () => call("/v1/auth/me"),
   changePassword: (old_password, new_password) => post("/v1/auth/password", { old_password, new_password }),

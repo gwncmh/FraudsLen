@@ -2,7 +2,8 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 const Card = React.forwardRef(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn("rounded-xl border bg-card text-card-foreground shadow-sm", className)} {...props} />
+  // min-w-0: card nằm trong grid/flex được phép co theo cột, không đẩy trang tràn ngang trên màn hình hẹp
+  <div ref={ref} className={cn("min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm", className)} {...props} />
 ));
 Card.displayName = "Card";
 
@@ -35,9 +36,9 @@ CardFooter.displayName = "CardFooter";
 function CardHeaderRow({ title, description, icon: Icon, actions, className }) {
   return (
     <CardHeader className={cn("flex-row items-start justify-between gap-3 space-y-0", className)}>
-      <div className="flex items-start gap-3">
-        {Icon && <div className="mt-0.5 rounded-lg bg-primary/10 p-2 text-primary"><Icon className="size-4" /></div>}
-        <div className="space-y-1">
+      <div className="flex min-w-0 items-start gap-3">
+        {Icon && <div className="mt-0.5 shrink-0 rounded-lg bg-primary/10 p-2 text-primary"><Icon className="size-4" /></div>}
+        <div className="min-w-0 space-y-1">
           <CardTitle>{title}</CardTitle>
           {description && <CardDescription>{description}</CardDescription>}
         </div>

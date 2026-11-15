@@ -1,9 +1,9 @@
-"""Tài khoản trên giao diện web: đăng ký, đăng nhập, phiên, đổi mật khẩu, quản lý người dùng (admin).
+"""Tài khoản trên giao diện web: đăng nhập, phiên, đổi mật khẩu, quản lý người dùng (admin).
 
+- Ứng dụng nội bộ: tài khoản được CẤP, không tự đăng ký. Admin tạo ở Cài đặt → Người dùng; tài khoản Admin đầu tiên
+  tạo bằng lệnh `python -m fraudlens.tools.admin create-user <tên> admin` (hàm provision_user bên dưới).
 - Mật khẩu băm PBKDF2-SHA256 (200 000 vòng, salt riêng); không lưu mật khẩu thật.
 - Phiên: token ngẫu nhiên "fls_..." trả cho trình duyệt; DB chỉ lưu SHA-256 của token.
-- Tài khoản đăng ký đầu tiên thành admin; các tài khoản sau là analyst, admin đổi vai trò ở trang Người dùng.
-- Token tĩnh trong DASHBOARD_TOKENS vẫn dùng được (tương thích bản cũ, script).
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fraudlens.api.auth import ROLES, SESSION_PREFIX, User, bearer_token, current_user, require_role
 from fraudlens.common.config import settings
@@ -25,26 +25,6 @@ users_router = APIRouter(prefix="/v1/users")
 
 PBKDF2_ROUNDS = 200_000
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS app_users (
-    id             BIGSERIAL PRIMARY KEY,
-    username       TEXT UNIQUE NOT NULL,
-    display_name   TEXT NOT NULL,
-    password_hash  TEXT NOT NULL,
-    role           TEXT NOT NULL CHECK (role IN ('analyst','risk_lead','admin')),
-    active         BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_login_at  TIMESTAMPTZ
-);
-CREATE TABLE IF NOT EXISTS app_sessions (
-    token_hash  TEXT PRIMARY KEY,
-    user_id     BIGINT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at  TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_sessions_user ON app_sessions (user_id);
-"""
 
 
 def hash_password(pw: str, salt: bytes | None = None) -> str:
@@ -81,54 +61,49 @@ def _public(u: dict) -> dict:
     return {k: u.get(k) for k in ("id", "username", "display_name", "role", "active", "created_at", "last_login_at")}
 
 
-# ------------------------------------------------------------------ đăng ký / đăng nhập
-class RegisterReq(BaseModel):
-    username: str
-    display_name: str | None = None
-    password: str
+# ------------------------------------------------------------------ đăng nhập
+MAX_PASSWORD = 128  # chặn mật khẩu cực dài làm PBKDF2 chạy lâu (từ chối dịch vụ)
+MAX_DISPLAY = 64
 
 
 class LoginReq(BaseModel):
-    username: str
-    password: str
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=1024)
 
 
 def _check_password_rule(pw: str) -> None:
     if len(pw) < 8 or not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
         raise HTTPException(400, "mật khẩu cần ít nhất 8 ký tự, có cả chữ và số")
+    if len(pw) > MAX_PASSWORD:
+        raise HTTPException(400, f"mật khẩu tối đa {MAX_PASSWORD} ký tự")
 
 
 @router.get("/config")
 def auth_config():
-    """Cho trang đăng nhập biết có mở đăng ký không và đã có tài khoản nào chưa."""
+    """Cho trang đăng nhập biết DB đã sẵn sàng và đã có tài khoản nào chưa (chưa có → hướng dẫn lệnh create-user)."""
     try:
         with tx() as conn:
             n = conn.execute("SELECT count(*) AS n FROM app_users").fetchone()["n"]
     except Exception:  # noqa: BLE001 – DB chưa sẵn sàng
         n = None
-    return {"allow_registration": settings.allow_registration or n == 0, "has_users": bool(n), "db_ready": n is not None}
+    return {"has_users": bool(n), "db_ready": n is not None}
 
 
-@router.post("/register")
-def register(r: RegisterReq):
-    username = r.username.strip().lower()
+def provision_user(conn, username: str, password: str, role: str, display_name: str | None, actor: str) -> dict:
+    """Cấp một tài khoản (dùng chung cho Admin trên web và lệnh CLI). Ném HTTPException nếu dữ liệu không hợp lệ."""
+    username = username.strip().lower()
     if not USERNAME_RE.match(username):
         raise HTTPException(400, "tên đăng nhập 3–32 ký tự: chữ, số, dấu . _ -")
-    _check_password_rule(r.password)
-    display = (r.display_name or "").strip() or username
-    with tx() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(4343)")  # tránh hai người cùng thành "tài khoản đầu tiên"
-        n = conn.execute("SELECT count(*) AS n FROM app_users").fetchone()["n"]
-        if n > 0 and not settings.allow_registration:
-            raise HTTPException(403, "đăng ký đang tắt, liên hệ admin để được cấp tài khoản")
-        if conn.execute("SELECT 1 FROM app_users WHERE username = %s", (username,)).fetchone():
-            raise HTTPException(409, "tên đăng nhập đã tồn tại")
-        role = "admin" if n == 0 else "analyst"
-        u = conn.execute("INSERT INTO app_users (username, display_name, password_hash, role, last_login_at) "
-                         "VALUES (%s,%s,%s,%s,now()) RETURNING *", (username, display, hash_password(r.password), role)).fetchone()
-        token, exp = _new_session(conn, u["id"])
-        audit(conn, "user", username, "REGISTER", f"user:{username}", {"role": role})
-    return {"token": token, "expires_at": exp, "user": _public(u)}
+    if role not in ROLES:
+        raise HTTPException(400, "vai trò không hợp lệ")
+    _check_password_rule(password)
+    if conn.execute("SELECT 1 FROM app_users WHERE username = %s", (username,)).fetchone():
+        raise HTTPException(409, "tên đăng nhập đã tồn tại")
+    u = conn.execute("INSERT INTO app_users (username, display_name, password_hash, role) VALUES (%s,%s,%s,%s) "
+                     "RETURNING *", (username, (display_name or "").strip()[:MAX_DISPLAY] or username,
+                                     hash_password(password), role)).fetchone()
+    audit(conn, "user", username, "CREATE", actor, {"role": role})
+    return u
 
 
 @router.post("/login")
@@ -157,8 +132,7 @@ def logout(authorization: str = Header(default="")):
 
 @router.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"username": user.name, "display_name": user.display_name or user.name, "role": user.role,
-            "account": user.user_id is not None}
+    return {"username": user.name, "display_name": user.display_name or user.name, "role": user.role}
 
 
 class PasswordReq(BaseModel):
@@ -168,8 +142,6 @@ class PasswordReq(BaseModel):
 
 @router.post("/password")
 def change_password(r: PasswordReq, user: User = Depends(current_user), authorization: str = Header(default="")):
-    if user.user_id is None:
-        raise HTTPException(400, "đăng nhập bằng token tĩnh không đổi được mật khẩu")
     _check_password_rule(r.new_password)
     with tx() as conn:
         u = conn.execute("SELECT password_hash FROM app_users WHERE id = %s", (user.user_id,)).fetchone()
@@ -209,19 +181,8 @@ class UserCreate(BaseModel):
 @users_router.post("")
 def create_user(r: UserCreate, user: User = Depends(current_user)):
     require_role(user, "admin")
-    username = r.username.strip().lower()
-    if not USERNAME_RE.match(username):
-        raise HTTPException(400, "tên đăng nhập 3–32 ký tự: chữ, số, dấu . _ -")
-    if r.role not in ROLES:
-        raise HTTPException(400, "vai trò không hợp lệ")
-    _check_password_rule(r.password)
     with tx() as conn:
-        if conn.execute("SELECT 1 FROM app_users WHERE username = %s", (username,)).fetchone():
-            raise HTTPException(409, "tên đăng nhập đã tồn tại")
-        u = conn.execute("INSERT INTO app_users (username, display_name, password_hash, role) VALUES (%s,%s,%s,%s) "
-                         "RETURNING *", (username, (r.display_name or "").strip() or username,
-                                         hash_password(r.password), r.role)).fetchone()
-        audit(conn, "user", username, "CREATE", f"user:{user.name}", {"role": r.role})
+        u = provision_user(conn, r.username, r.password, r.role, r.display_name, f"user:{user.name}")
     return _public(u)
 
 
@@ -240,7 +201,7 @@ def update_user(user_id: int, r: UserUpdate, user: User = Depends(current_user))
         if r.active is not None:
             changes["active"] = r.active
         if r.display_name is not None and r.display_name.strip():
-            changes["display_name"] = r.display_name.strip()
+            changes["display_name"] = r.display_name.strip()[:MAX_DISPLAY]
         if r.password:
             _check_password_rule(r.password)
             changes["password_hash"] = hash_password(r.password)

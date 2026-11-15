@@ -47,9 +47,12 @@ if (-not (Test-Path .env)) {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $hmac = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $src = -join ($bytes[0..15] | ForEach-Object { $_.ToString("x2") })
     $content = (Get-Content .env.example -Raw -Encoding UTF8) -replace "(?m)^HMAC_KEY=.*$", "HMAC_KEY=$hmac"
+    $content = $content -replace "(?m)^SOURCE_API_KEY=.*$", "SOURCE_API_KEY=$src"
     [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot ".env"), $content, (New-Object System.Text.UTF8Encoding $false))
-    Write-Host "Đã tạo .env với HMAC_KEY ngẫu nhiên (không đổi khóa này sau khi đã có dữ liệu)."
+    Write-Host "Đã tạo .env với HMAC_KEY và SOURCE_API_KEY ngẫu nhiên (không đổi HMAC_KEY sau khi đã có dữ liệu)."
 } else {
     Write-Host ".env đã có – giữ nguyên."
 }
@@ -95,6 +98,6 @@ for ($i = 0; $i -lt 60; $i++) {
 if (-not $ok) { Write-Host "API chưa trả lời sau 2 phút – xem: docker compose logs api --tail 50" -ForegroundColor Yellow }
 
 Write-Host "`nFraudLens đang chạy: http://localhost:3000" -ForegroundColor Green
-Write-Host "Lần đầu: bấm 'Đăng ký' – tài khoản đầu tiên là Admin. Làm theo checklist ở trang 'Hệ thống'."
+Write-Host "Lần đầu: cấp tài khoản Admin bằng 'docker compose exec api python -m fraudlens.tools.admin create-user admin admin'. Làm theo checklist ở trang 'Hệ thống'."
 Write-Host "Tắt hệ thống: .\start.ps1 -Stop"
 Start-Process "http://localhost:3000"

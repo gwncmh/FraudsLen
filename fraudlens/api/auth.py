@@ -1,10 +1,9 @@
 """Xác thực cho API.
 
 - Nguồn giao dịch / nhãn: header X-API-Key = SOURCE_API_KEY.
-- Dashboard: header Authorization: Bearer <token>. Token là một trong hai loại:
-    * phiên đăng nhập "fls_..." do /v1/auth/login hoặc /v1/auth/register cấp (tài khoản lưu trong PostgreSQL,
-      xem fraudlens/api/accounts.py);
-    * token tĩnh khai báo trong DASHBOARD_TOKENS (tương thích bản cũ, dùng cho script).
+- Dashboard: header Authorization: Bearer <token>, token là phiên đăng nhập "fls_..." do /v1/auth/login cấp.
+  Ứng dụng nội bộ: không tự đăng ký, không token tĩnh. Tài khoản do Admin cấp (trang Người dùng) hoặc bằng lệnh
+  `python -m fraudlens.tools.admin create-user` (xem fraudlens/api/accounts.py).
 """
 from __future__ import annotations
 
@@ -25,15 +24,19 @@ class User:
     name: str
     role: str
     display_name: str | None = None
-    user_id: int | None = None  # None = đăng nhập bằng token tĩnh
+    user_id: int | None = None
 
 
-def _tokens() -> dict[str, User]:
-    out = {}
-    for item in settings.dashboard_tokens.split(","):
-        parts = item.strip().split(":")
-        if len(parts) == 3 and parts[2] in ROLES:
-            out[parts[1]] = User(parts[0], parts[2])
+# Khóa mẫu từng nằm trong .env.example: ai đọc repo cũng biết, nên phải cảnh báo khi còn dùng
+DEMO_SOURCE_KEY = "dev-source-key"
+
+
+def security_warnings() -> list[str]:
+    """Cấu hình đang yếu (FR-09). Hiện ở trang Cài đặt → Hệ thống và ghi log lúc API khởi động."""
+    out = []
+    if settings.source_api_key == DEMO_SOURCE_KEY:
+        out.append("SOURCE_API_KEY đang là khóa mẫu dev-source-key: ai cũng gửi được giao dịch và nhãn. "
+                   "Đổi thành chuỗi ngẫu nhiên trong .env.")
     return out
 
 
@@ -61,9 +64,7 @@ def require_source(x_api_key: str = Header(default="")) -> None:
 
 def current_user(authorization: str = Header(default="")) -> User:
     token = bearer_token(authorization)
-    user = _tokens().get(token) if token else None
-    if user is None and token.startswith(SESSION_PREFIX) and len(token) > 20:
-        user = _session_user(token)
+    user = _session_user(token) if token.startswith(SESSION_PREFIX) and len(token) > 20 else None
     if not user:
         raise HTTPException(401, "chưa đăng nhập")
     return user

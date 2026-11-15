@@ -101,8 +101,6 @@ def compute_once() -> None:
     rc = load_json(v, "routing_config.json")
     out: list[tuple[str, str | None, float, str | None]] = []  # (metric, feature, value, level)
     with tx() as conn:
-        conn.execute("ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS owner TEXT")
-        conn.execute("ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS action TEXT")
         t_end = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status = 'VALID'").fetchone()["t"]
         if t_end is None:
             log.info("chưa có giao dịch")
@@ -149,10 +147,11 @@ def compute_once() -> None:
                         rate_level(frac["UNSCORED"], settings.unscored_warn, settings.unscored_alert)))
             out.append(("invalid_rate", None, invalid, rate_level(invalid, settings.unscored_warn, settings.unscored_alert)))
 
-        # chất lượng trên nhãn trễ (30 ngày gần nhất)
+        # chất lượng trên nhãn trễ (30 ngày gần nhất); chỉ giao dịch VALID – nhãn của payload lỗi không nói gì về model
         lab = conn.execute(
             "SELECT l.is_fraud, d.route, s.score FROM labels_eval l JOIN transactions t ON t.trans_num = l.trans_num "
-            "JOIN routing_decisions d ON d.txn_id = t.id JOIN scores s ON s.txn_id = t.id WHERE t.event_ts > %s",
+            "JOIN routing_decisions d ON d.txn_id = t.id JOIN scores s ON s.txn_id = t.id "
+            "WHERE t.status = 'VALID' AND t.event_ts > %s",
             (int(t_end) - 30 * 86400,)).fetchall()
         if lab:
             y = np.array([bool(r["is_fraud"]) for r in lab])

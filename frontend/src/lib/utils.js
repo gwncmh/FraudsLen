@@ -8,6 +8,7 @@ export function cn(...inputs) {
 export const ROLE_LABELS = { analyst: "Fraud Analyst", risk_lead: "Risk Lead", admin: "Admin" };
 export const CASE_STATUS = {
   OPEN: "Mới", INVESTIGATING: "Đang điều tra", ESCALATED: "Đã chuyển cấp", CLOSED_FRAUD: "Đóng – gian lận", CLOSED_LEGIT: "Đóng – hợp lệ",
+  CLOSED_INVALID: "Đóng – lỗi dữ liệu",
 };
 export const JOB_STATUS = { RUNNING: "Đang chạy", STOPPING: "Đang dừng", DONE: "Xong", FAILED: "Lỗi", STOPPED: "Đã dừng" };
 export const JOB_KINDS = {
@@ -19,7 +20,8 @@ export const FEATURE_LABELS = {
   n_txn_24h: "Số GD 24 giờ", n_txn_7d: "Số GD 7 ngày", n_txn_30d: "Số GD 30 ngày", amt_mean_30d: "TB số tiền 30 ngày",
   amt_ratio_30d: "Số tiền / TB 30 ngày", amt_zscore_30d: "Z-score số tiền 30 ngày", is_new_category_30d: "Loại merchant mới",
   is_new_merchant_30d: "Merchant mới", secs_since_last: "Giây từ GD trước", is_night: "Giờ khuya", category: "Loại merchant",
-  city_pop: "Dân số thành phố",
+  city_pop: "Dân số thành phố", log_amt: "Số tiền (log)", log_city_pop: "Dân số thành phố (log)", dow: "Thứ trong tuần",
+  sum_amt_24h: "Tổng tiền 24 giờ", n_distinct_cat_24h: "Số loại merchant 24 giờ",
 };
 
 export const num = (v, d = 0) =>
