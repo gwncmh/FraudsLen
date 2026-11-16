@@ -102,6 +102,7 @@ def startup() -> None:
             log.info("warmup Redis từ PostgreSQL: %d bản ghi", n)
     except Exception as e:  # noqa: BLE001
         log.error("warmup Redis thất bại: %s", e)
+    ops.warm_csv_cache()  # luồng nền: trang Simulator không phải đợi đọc CSV vài trăm MB
 
 
 # ------------------------------------------------------------------ nguồn dữ liệu

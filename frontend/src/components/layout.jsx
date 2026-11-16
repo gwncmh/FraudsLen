@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeftRight, Boxes, ChevronsLeft, ChevronsRight, ClipboardCheck, LayoutDashboard, LogOut, Monitor, Moon, PlayCircle,
@@ -36,6 +36,8 @@ export function AppShell({ user, active, onLogout, children }) {
   const [openCases, setOpenCases] = useState(null);
   const [healthy, setHealthy] = useState(true);
   const [q, setQ] = useState("");
+  const scrollRef = useRef(null);
+  useEffect(() => { scrollRef.current?.scrollTo(0, 0); }, [active]); // đổi trang: nội dung về đầu, sidebar giữ nguyên
 
   usePoll(() => {
     api.stats().then((s) => { setOpenCases(s.open_cases.reduce((a, r) => a + r.n, 0)); setHealthy(true); }).catch(() => setHealthy(false));
@@ -46,16 +48,16 @@ export function AppShell({ user, active, onLogout, children }) {
   const initial = (user.display_name || user.username).slice(0, 1).toUpperCase();
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-screen overflow-hidden">
       <motion.aside animate={{ width: collapsed ? 68 : 240 }} transition={{ duration: 0.2 }}
-        className="sticky top-0 hidden h-screen shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex">
+        className="hidden h-full shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex">
         <a href="#/" className="flex h-14 items-center gap-2.5 border-b border-sidebar-border px-4 hover:no-underline">
           <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-gradient-to-br from-primary to-critical text-white shadow">
             <ShieldHalf className="size-4" />
           </div>
           {!collapsed && <div className="leading-tight"><p className="font-bold text-foreground">FraudLens</p><p className="text-[10px] text-muted-foreground">Fraud operations</p></div>}
         </a>
-        <nav className="flex flex-1 flex-col gap-1 p-3">
+        <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
           {nav.map((n) => (
             <a key={n.key} href={n.href} title={n.label}
               className={cn("group relative flex items-center gap-3 rounded-md px-2.5 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground",
@@ -74,7 +76,7 @@ export function AppShell({ user, active, onLogout, children }) {
         </div>
       </motion.aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div ref={scrollRef} className="flex min-w-0 flex-1 flex-col overflow-y-auto">
         <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b bg-background/80 px-4 backdrop-blur md:px-6">
           {/* điều hướng gọn cho màn hình nhỏ */}
           <div className="flex gap-1 md:hidden">

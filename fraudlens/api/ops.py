@@ -180,45 +180,116 @@ class SimParams(BaseModel):
     seed: int = 7
 
 
-_csv_times: dict[str, tuple[int, "object"]] = {}  # file -> (mtime_ns, mảng thời gian giao dịch dạng epoch giây)
-_csv_lock = threading.Lock()
+_csv_times: dict[str, tuple[tuple[int, int], "object"]] = {}  # file -> ((size, mtime_ns), mảng thời gian epoch giây)
+_csv_locks: dict[str, threading.Lock] = {}
+_csv_guard = threading.Lock()
+_csv_warming: set[str] = set()
 
 
-def _csv_event_times(path):
-    """Thời gian giao dịch của mọi dòng trong CSV (đọc một lần, cache theo mtime của file)."""
-    import pandas as pd
+def _csv_cache_file(path, sig) -> "Path":
+    from pathlib import Path
+    import tempfile
+    d = Path(tempfile.gettempdir()) / "fraudlens"  # data/ chỉ đọc trong container; /tmp dùng chung cho mọi worker uvicorn
+    return d / f"{path.stem}-{sig[0]}-{sig[1]}.times.npy"
 
-    from fraudlens.tools.simulator import epoch_s
-    mt = path.stat().st_mtime_ns
-    with _csv_lock:
-        hit = _csv_times.get(str(path))
-        if hit and hit[0] == mt:
+
+def _csv_event_times(path, wait: bool = True):
+    """Thời gian giao dịch của mọi dòng trong CSV. Đọc file (vài trăm MB, ~30 s) MỘT lần rồi cache trong bộ nhớ và ra
+    đĩa (.npy, theo kích thước + mtime) để các worker uvicorn khác và lần khởi động sau không phải đọc lại.
+    wait=False: chưa có cache thì trả None ngay (việc đọc chạy ở luồng nền)."""
+    import numpy as np
+
+    st = path.stat()
+    sig = (st.st_size, st.st_mtime_ns)
+    key = str(path)
+    hit = _csv_times.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    if not wait:
+        with _csv_guard:
+            if key not in _csv_warming:
+                _csv_warming.add(key)
+                threading.Thread(target=_warm_one, args=(path,), name=f"csv-times-{path.stem}", daemon=True).start()
+        return None
+    with _csv_guard:
+        lock = _csv_locks.setdefault(key, threading.Lock())
+    with lock:
+        hit = _csv_times.get(key)
+        if hit and hit[0] == sig:
             return hit[1]
-        t = epoch_s(pd.read_csv(path, usecols=["trans_date_trans_time"])["trans_date_trans_time"])
-        _csv_times[str(path)] = (mt, t)
+        f = _csv_cache_file(path, sig)
+        t = None
+        if f.exists():
+            try:
+                t = np.load(f)
+            except Exception as e:  # noqa: BLE001 – cache hỏng: đọc lại CSV
+                log.warning("cache %s hỏng (%s), đọc lại CSV", f, e)
+        if t is None:
+            import pandas as pd
+
+            from fraudlens.tools.simulator import epoch_s
+            t0 = time.monotonic()
+            t = epoch_s(pd.read_csv(path, usecols=["trans_date_trans_time"])["trans_date_trans_time"])
+            log.info("đọc thời gian giao dịch của %s: %d dòng, %.1f s", path.name, len(t), time.monotonic() - t0)
+            try:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                tmp = f.with_suffix(f".{threading.get_ident()}.tmp")
+                with open(tmp, "wb") as fh:
+                    np.save(fh, t)
+                tmp.replace(f)
+            except OSError as e:
+                log.warning("không ghi được cache %s: %s", f, e)
+        _csv_times[key] = (sig, t)
         return t
 
 
-def _next_offset(dataset: str) -> int:
+def _warm_one(path) -> None:
+    try:
+        _csv_event_times(path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("không đọc được %s: %s", path, e)
+    finally:
+        with _csv_guard:
+            _csv_warming.discard(str(path))
+
+
+def warm_csv_cache() -> None:
+    """Gọi lúc API khởi động: đọc trước thời gian giao dịch của các file dữ liệu ở luồng nền."""
+    for f in ("fraudTest.csv", "fraudTrain.csv"):
+        p = settings.data_dir / f
+        if p.exists():
+            _csv_event_times(p, wait=False)
+
+
+def _next_offset_info(dataset: str, wait: bool = True) -> tuple[int, bool]:
     """Offset để "chạy tiếp": lớn hơn trong hai mốc
     - next_offset của lần chạy simulator trên web gần nhất;
     - số dòng của file có thời gian <= giao dịch mới nhất đã có trong DB. Mốc này tính cả các lần chạy bằng DÒNG LỆNH
       (web không biết): nếu chỉ dựa vào lịch sử job, web sẽ gửi lại giao dịch đã xử lý -> nhận kết quả cũ (model cũ)
-      hoặc bị đánh STALE."""
+      hoặc bị đánh STALE.
+    Trả (offset, pending): pending=True khi wait=False và file chưa đọc xong (offset lúc đó chỉ theo lịch sử job)."""
     with tx() as conn:
         r = conn.execute("SELECT result->>'next_offset' AS o FROM ops_jobs WHERE kind = 'simulator' "
                          "AND params->>'dataset' = %s AND result ? 'next_offset' ORDER BY id DESC LIMIT 1",
                          (dataset,)).fetchone()
         last = conn.execute("SELECT max(event_ts) AS t FROM transactions WHERE status = 'VALID'").fetchone()["t"]
     by_job = int(r["o"]) if r and r["o"] else 0
-    by_db = 0
+    by_db, pending = 0, False
     p = settings.data_dir / ("fraudTest.csv" if dataset == "test" else "fraudTrain.csv")
     if last is not None and p.exists():
         try:
-            by_db = int((_csv_event_times(p) <= int(last)).sum())
+            times = _csv_event_times(p, wait=wait)
+            if times is None:
+                pending = True
+            else:
+                by_db = int((times <= int(last)).sum())
         except Exception as e:  # noqa: BLE001 – file lỗi: vẫn chạy tiếp theo lịch sử job
             log.warning("không đọc được %s để tính offset: %s", p, e)
-    return max(by_job, by_db)
+    return max(by_job, by_db), pending
+
+
+def _next_offset(dataset: str) -> int:
+    return _next_offset_info(dataset)[0]
 
 
 def _csv(dataset: str):
@@ -232,7 +303,9 @@ def _csv(dataset: str):
 def simulator_status(user: User = Depends(current_user)):
     jobs = _list_jobs("simulator", 15)
     running = next((j for j in jobs if j["status"] in ("RUNNING", "STOPPING")), None)
-    return {"running": running, "history": jobs, "next_offset": {d: _next_offset(d) for d in ("test", "train")},
+    offsets = {d: _next_offset_info(d, wait=False) for d in ("test", "train")}  # không chặn request khi CSV chưa đọc xong
+    return {"running": running, "history": jobs, "next_offset": {d: o for d, (o, _) in offsets.items()},
+            "next_offset_pending": {d: pend for d, (_, pend) in offsets.items()},
             "data_files": {d: (settings.data_dir / f).exists() for d, f in (("test", "fraudTest.csv"), ("train", "fraudTrain.csv"))}}
 
 
@@ -406,9 +479,11 @@ def system_status(lane) -> dict:
     # dịch vụ
     svc = {"api": {"ok": True, "routing_config": lane.rc and lane.rc["config_version"],
                    "scorer_breaker_open": lane.scorer.breaker.is_open}}
-    svc["scorer"] = _probe(settings.scorer_url.rstrip("/") + "/health")
-    svc["worker"] = _probe(settings.worker_metrics_url)
-    svc["monitor"] = _probe(settings.monitor_metrics_url)
+    from concurrent.futures import ThreadPoolExecutor
+    urls = {"scorer": settings.scorer_url.rstrip("/") + "/health", "worker": settings.worker_metrics_url,
+            "monitor": settings.monitor_metrics_url}
+    with ThreadPoolExecutor(len(urls)) as ex:  # thăm dò song song: dịch vụ chết không cộng dồn timeout
+        svc.update(zip(urls, ex.map(_probe, urls.values())))
     svc["worker"].pop("body", None); svc["monitor"].pop("body", None)
     try:
         lane.hist.r.ping()

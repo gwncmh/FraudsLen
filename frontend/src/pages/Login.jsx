@@ -30,6 +30,7 @@ export default function Login({ onDone }) {
     try {
       const r = await api.login(f.username, f.password);
       setToken(r.token);
+      window.location.hash = "#/";
       onDone();
     } catch (ex) {
       setToken("");

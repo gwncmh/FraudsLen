@@ -145,7 +145,7 @@ export default function Simulator({ user }) {
       {canRun && !st.running && (
         <div className="mb-6 grid gap-6 lg:grid-cols-5">
           <Card className="lg:col-span-2">
-            <CardHeaderRow icon={Rocket} title="Chạy nhanh" description={`Tự tiếp tục từ offset ${num(st.next_offset[form.dataset])}`} />
+            <CardHeaderRow icon={Rocket} title="Chạy nhanh" description={st.next_offset_pending?.[form.dataset] ? "Đang tính offset chạy tiếp…" : `Tự tiếp tục từ offset ${num(st.next_offset[form.dataset])}`} />
             <CardContent className="grid gap-3 sm:grid-cols-2">
               {PRESETS.map((p, i) => (
                 <motion.button key={p.key} whileHover={{ y: -2 }} whileTap={{ scale: 0.98 }} disabled={busy || noData} onClick={() => start(p.p)}
@@ -166,7 +166,7 @@ export default function Simulator({ user }) {
                   </NativeSelect>
                 </Field>
                 <Field label="Số giao dịch"><Input type="number" min="1" value={form.limit} onChange={set("limit")} /></Field>
-                <Field label="Offset (trống = chạy tiếp)"><Input type="number" min="0" value={form.offset} placeholder={String(st.next_offset[form.dataset])} onChange={set("offset")} /></Field>
+                <Field label="Offset (trống = chạy tiếp)"><Input type="number" min="0" value={form.offset} placeholder={st.next_offset_pending?.[form.dataset] ? "đang tính…" : String(st.next_offset[form.dataset])} onChange={set("offset")} /></Field>
                 <Field label="GD/giây (0 = tối đa)"><Input type="number" min="0" value={form.tps} onChange={set("tps")} /></Field>
                 <Field label="Luồng gửi"><Input type="number" min="1" max="32" value={form.threads} onChange={set("threads")} /></Field>
                 <Field label="Tỉ lệ payload lỗi"><Input type="number" step="0.01" min="0" max="1" value={form.fault_rate} onChange={set("fault_rate")} /></Field>
